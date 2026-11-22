@@ -75,12 +75,18 @@ pub struct SpotTrack {
 pub struct TalkPause {
     /// uri трека в момент нашей паузы.
     ours: Option<String>,
+    /// Разговор идёт: запуски Spotify откладываем до его конца.
+    active: bool,
+    /// Отложенная команда `ctl` (запуск после разговора, чтобы не играть поверх него).
+    deferred: Option<Vec<String>>,
+    /// После нашего next/prev возобновляем то, что играет сейчас, а не только исходный трек.
+    follow: bool,
 }
 
 impl TalkPause {
     /// Джарвис проснулся. `true` — Spotify играет и его надо поставить на паузу.
     pub fn on_wake(&mut self, sp: &SpotState) -> bool {
-        if self.ours.is_none() && sp.status == "playing" {
+        if self.ours.is_none() && self.deferred.is_none() && sp.status == "playing" {
             self.ours = Some(sp.uri.clone());
             return true;
         }
@@ -90,12 +96,48 @@ impl TalkPause {
     /// Разговор закончился. `true` — пауза наша и ничего не сменилось: надо слать play. Всегда забывает паузу.
     pub fn on_end(&mut self, sp: &SpotState) -> bool {
         let ours = self.ours.take();
-        ours.is_some_and(|u| u == sp.uri) && sp.status == "paused"
+        let follow = std::mem::take(&mut self.follow);
+        ours.is_some_and(|u| follow || u == sp.uri) && sp.status == "paused"
     }
 
     /// Пауза не состоялась или человек сам распорядился музыкой: возобновлять нечего.
     pub fn forget(&mut self) {
         self.ours = None;
+        self.follow = false;
+        self.deferred = None;
+    }
+
+    /// Разговор начался.
+    pub fn begin(&mut self) {
+        self.active = true;
+    }
+
+    /// Разговор закончился: новые запуски идут сразу.
+    pub fn finish(&mut self) {
+        self.active = false;
+    }
+
+    /// Пока идёт разговор — запоминает команду `ctl` на после него (и заменяет «вернуть нашу паузу»).
+    /// `false` — разговора нет, команду надо выполнить сразу.
+    pub fn defer(&mut self, args: Vec<String>) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.ours = None;
+        self.follow = false;
+        self.deferred = Some(args);
+        true
+    }
+
+    pub fn take_deferred(&mut self) -> Option<Vec<String>> {
+        self.deferred.take()
+    }
+
+    /// Мы сменили трек (next/prev) во время нашей паузы: возобновить надо тот, что стал текущим.
+    pub fn follow(&mut self) {
+        if self.ours.is_some() {
+            self.follow = true;
+        }
     }
 
     fn is_ours(&self) -> bool {
@@ -327,6 +369,7 @@ impl Music {
     /// Джарвис проснулся: Spotify на паузу, не задерживая слушание. Неблокирующий.
     pub fn talk_started(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
         *self.talk_at.lock().unwrap() = Some(Instant::now());
+        self.talk.lock().unwrap().begin();
         self.quiet.send_replace(false);
         let m = self.clone();
         rt.spawn(async move {
@@ -337,8 +380,13 @@ impl Music {
     }
 
     async fn pause_for_talk(&self) {
-        let live = tokio::time::timeout(Duration::from_millis(1200), spotify::now()).await.ok().flatten();
-        let sp = live.unwrap_or_else(|| self.spotify_current());
+        let cached = self.spotify_current();
+        let sp = if cached.status == "playing" {
+            cached
+        } else {
+            let live = tokio::time::timeout(Duration::from_millis(1200), spotify::now()).await.ok().flatten();
+            end_state(live, cached)
+        };
         if !self.talk.lock().unwrap().on_wake(&sp) {
             return;
         }
@@ -372,8 +420,27 @@ impl Music {
     /// Разговор окончен: вернуть Spotify, только если пауза наша. Неблокирующий.
     pub fn talk_ended(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
         let m = self.clone();
+        self.talk.lock().unwrap().finish();
         rt.spawn(async move {
             let _gate = m.talk_gate.lock().await;
+            let deferred = m.talk.lock().unwrap().take_deferred();
+            if let Some(args) = deferred {
+                // YouTube или Алиса заиграли во время разговора — отложенный запуск отменяется
+                if m.state().playing || m.alice.lock().unwrap().playing() {
+                    return;
+                }
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match spotify::ctl(&refs).await {
+                    Ok(()) => {
+                        if matches!(refs.first(), Some(&"play") | Some(&"search")) {
+                            m.mark_spotify("playing");
+                        }
+                        log::info!("spotify: отложенный запуск после разговора ({})", refs.first().unwrap_or(&""));
+                    }
+                    Err(e) => log::warn!("spotify: отложенный запуск не удался: {e}"),
+                }
+                return;
+            }
             if !m.talk.lock().unwrap().is_ours() {
                 return;
             }
@@ -390,6 +457,27 @@ impl Music {
                 log::info!("spotify: возобновлён после разговора");
             }
         });
+    }
+
+    /// Запуск Spotify: во время разговора откладывается до его конца, иначе выполняется сразу.
+    async fn spotify_start(&self, args: &[&str]) -> Result<(), String> {
+        if self.talk.lock().unwrap().defer(args.iter().map(|a| a.to_string()).collect()) {
+            return Ok(());
+        }
+        spotify::ctl(args).await
+    }
+
+    /// next/prev: в нашу паузу — сразу и возобновить то, что стало текущим; иначе как запуск.
+    async fn spotify_skip(&self, op: &str) -> Result<(), String> {
+        let ours = {
+            let mut t = self.talk.lock().unwrap();
+            t.follow();
+            t.is_ours()
+        };
+        if ours {
+            return spotify::ctl(&[op]).await;
+        }
+        self.spotify_start(&[op]).await
     }
 
     /// Человек сам решил судьбу музыки (пауза, стоп): возобновлять после разговора нечего.
@@ -437,11 +525,14 @@ impl Music {
                 self.mark_spotify("paused");
             }
             "resume" => {
-                spotify::ctl(&["play"]).await?;
-                self.mark_spotify("playing");
+                let deferred = self.talk.lock().unwrap().defer(vec!["play".into()]);
+                if !deferred {
+                    spotify::ctl(&["play"]).await?;
+                    self.mark_spotify("playing");
+                }
             }
-            "next" | "related" => spotify::ctl(&["next"]).await?,
-            "prev" => spotify::ctl(&["prev"]).await?,
+            "next" | "related" => self.spotify_skip("next").await?,
+            "prev" => self.spotify_skip("prev").await?,
             "like" => spotify::ctl(&["like"]).await?,
             "unlike" => spotify::ctl(&["unlike"]).await?,
             "shuffle" => spotify::ctl(&["shuffle", if args["on"].as_bool().unwrap_or(false) { "on" } else { "off" }]).await?,
@@ -682,13 +773,17 @@ impl Music {
     pub async fn play_smart(&self, host: &Host, query: &str, source: &str, kind: &str, queue: bool) -> String {
         let mut found = None;
         let mut searched = false;
+        let mut search_failed = false;
         if wants_search(source, kind, queue) {
             let conf = spotify::SpotifyConf::load();
             if conf.can_search() {
                 searched = true;
                 match spotify::search(&conf, query, spotify_kind(kind)).await {
                     Ok(p) => found = p,
-                    Err(e) => log::warn!("spotify: поиск не удался: {e}"),
+                    Err(e) => {
+                        search_failed = true;
+                        log::warn!("spotify: поиск не удался: {e}");
+                    }
                 }
             }
         }
@@ -696,7 +791,7 @@ impl Music {
             PlayPlan::Liked(i) => {
                 let (phrase, answer) = LIKED[i];
                 self.stop_youtube(host).await;
-                match spotify::ctl(&["search", phrase]).await {
+                match self.spotify_start(&["search", phrase]).await {
                     Ok(()) => answer.to_string(),
                     Err(e) => format!("Не получилось включить в Spotify: {e}"),
                 }
@@ -707,7 +802,7 @@ impl Music {
             }
             PlayPlan::Spotify(pick) => {
                 self.stop_youtube(host).await;
-                match spotify::ctl(&["play", &pick.uri]).await {
+                match self.spotify_start(&["play", &pick.uri]).await {
                     Ok(()) => format!("Включил в Spotify: {}.", pick.label),
                     Err(e) => {
                         log::warn!("spotify: play не удался: {e}");
@@ -717,7 +812,13 @@ impl Music {
             }
             PlayPlan::YoutubeFallback => {
                 let reply = self.play(host, query, false).await;
-                if searched { format!("В Spotify не нашёл, {}", lower_first(&reply)) } else { reply }
+                if search_failed {
+                    format!("Spotify не ответил, {}", lower_first(&reply))
+                } else if searched {
+                    format!("В Spotify не нашёл, {}", lower_first(&reply))
+                } else {
+                    reply
+                }
             }
         }
     }
@@ -1027,9 +1128,20 @@ pub fn volume_loop(music: Arc<Music>, host: Arc<Host>, duck: impl Fn() -> bool +
 
 pub fn played_music_title(tool_name: &str, result: &str) -> Option<String> {
     match tool_name {
-        "play_music" => result
-            .strip_prefix("Включил с YouTube:")
-            .map(|s| s.trim().trim_end_matches('.').to_string()),
+        "play_music" => {
+            if let Some((phrase, _)) = LIKED.iter().find(|(_, answer)| *answer == result.trim()) {
+                return Some((*phrase).to_string());
+            }
+            // «Включил с YouTube: …», «Включил в Spotify: …» и YouTube-запасные ответы
+            // («В Spotify не нашёл, включил с YouTube: …», «… не получилось, …», «Spotify не ответил, …»)
+            ["Включил с YouTube:", "Включил в Spotify:", ", включил с YouTube:"]
+                .iter()
+                .find_map(|p| {
+                    let at = result.find(p)?;
+                    (at == 0 || *p == ", включил с YouTube:").then(|| &result[at + p.len()..])
+                })
+                .map(|s| s.trim().trim_end_matches('.').to_string())
+        }
         "music_control" => result
             .strip_prefix("Включил «")
             .and_then(|s| s.strip_suffix("».").or_else(|| s.strip_suffix('»')))
@@ -1181,6 +1293,15 @@ mod tests {
             played_music_title("music_control", "Включил «Сало».").as_deref(),
             Some("Сало")
         );
+        assert_eq!(played_music_title("play_music", "Включил в Spotify: Кино — Группа крови.").as_deref(), Some("Кино — Группа крови"));
+        assert_eq!(played_music_title("play_music", "Включил любимое в Spotify.").as_deref(), Some("моё любимое"));
+        assert_eq!(played_music_title("play_music", "Включил любимое вперемешку в Spotify.").as_deref(), Some("любимое вперемешку"));
+        assert_eq!(played_music_title("play_music", "Включил рекомендации в Spotify.").as_deref(), Some("рекомендации"));
+        assert_eq!(played_music_title("play_music", "В Spotify не нашёл, включил с YouTube: Сало.").as_deref(), Some("Сало"));
+        assert_eq!(played_music_title("play_music", "В Spotify не получилось, включил с YouTube: Сало.").as_deref(), Some("Сало"));
+        assert_eq!(played_music_title("play_music", "Spotify не ответил, включил с YouTube: Сало.").as_deref(), Some("Сало"));
+        assert!(played_music_title("play_music", "В Spotify не получилось, не получилось: ошибка").is_none());
+        assert!(played_music_title("play_music", "Не получилось включить в Spotify: ошибка").is_none());
         assert!(played_music_title("play_music", "В очереди: Сало.").is_none());
         assert!(
             played_music_title(
@@ -1373,6 +1494,57 @@ mod tests {
         t.on_wake(&spt("playing", "u1"));
         t.forget();
         assert!(!t.on_end(&spt("paused", "u1")));
+    }
+    #[test] fn defer_only_during_talk() {
+        let mut t = TalkPause::default();
+        assert!(!t.defer(vec!["play".into()]));
+        t.begin();
+        assert!(t.defer(vec!["play".into(), "spotify:track:1".into()]));
+        t.finish();
+        assert!(!t.defer(vec!["play".into()]));
+    }
+    #[test] fn deferred_play_replaces_resume() {
+        let mut t = TalkPause::default();
+        t.begin();
+        assert!(t.on_wake(&spt("playing", "u1")));
+        assert!(t.defer(vec!["play".into(), "u2".into()]));
+        assert!(!t.is_ours());
+        assert!(!t.on_end(&spt("paused", "u1")));
+        assert_eq!(t.take_deferred(), Some(vec!["play".to_string(), "u2".to_string()]));
+        assert_eq!(t.take_deferred(), None);
+    }
+    #[test] fn late_wake_does_not_override_deferred() {
+        let mut t = TalkPause::default();
+        t.begin();
+        t.defer(vec!["play".into()]);
+        assert!(!t.on_wake(&spt("playing", "u1")));
+    }
+    #[test] fn manual_pause_cancels_deferred() {
+        let mut t = TalkPause::default();
+        t.begin();
+        t.defer(vec!["play".into()]);
+        t.forget();
+        assert_eq!(t.take_deferred(), None);
+    }
+    #[test] fn follow_resumes_whatever_is_current() {
+        let mut t = TalkPause::default();
+        assert!(t.on_wake(&spt("playing", "u1")));
+        t.follow();
+        assert!(t.on_end(&spt("paused", "u2")));
+        // follow не переживает разговор
+        assert!(t.on_wake(&spt("playing", "u3")));
+        assert!(!t.on_end(&spt("paused", "u4")));
+    }
+    #[test] fn follow_never_resumes_manual_pause() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        t.follow();
+        t.forget();
+        assert!(!t.on_end(&spt("paused", "u2")));
+        // без нашей паузы follow ничего не создаёт
+        let mut t = TalkPause::default();
+        t.follow();
+        assert!(!t.on_end(&spt("paused", "u2")));
     }
     #[tokio::test]
     async fn wait_quiet_is_bounded_and_noop_without_talk() {
