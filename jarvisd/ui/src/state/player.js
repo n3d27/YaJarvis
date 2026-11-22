@@ -63,6 +63,10 @@ export function setArt(img, art, fallback) {
   img.src = art;
 }
 
+// источники, которыми управляет не очередь Джарвиса (обложка и ссылка приходят в снимке)
+export const SOURCE_LABELS = { yandex: "Яндекс Музыка", spotify: "Spotify", youtube: "YouTube" };
+export const isExternal = (state) => state?.source === "yandex" || state?.source === "spotify";
+
 // управление музыкой — общее для главной и страницы «Плеер»
 export function musicAct(a, b, { disableControl = true } = {}) {
   if (!M) return;
@@ -81,7 +85,10 @@ export function musicAct(a, b, { disableControl = true } = {}) {
     return music({ action: "repeat", on: !M.repeat }, control)
       .then((ok) => ok && toast(M.repeat ? "Повтор трека включён" : "Повтор выключен"));
   }
-  if (a === "prev" && M.source !== "yandex") {
+  if (a === "like") {
+    return music({ action: "like" }, control).then((ok) => ok && toast("Добавил в любимые"));
+  }
+  if (a === "prev" && !isExternal(M)) {
     const previous = M.history?.[1];
     if (previous) return music({ action: "id", query: previous.ID }, control);
     return;
@@ -251,7 +258,7 @@ export async function playMusicQuery(query) {
 
 export function artOf(track, big, state = M) {
   if (!track?.ID) return "";
-  if (state?.source === "yandex") return state.cover || "";
+  if (isExternal(state)) return state.cover || "";
   return `https://i.ytimg.com/vi/${encodeURIComponent(track.ID)}/${big ? "maxresdefault" : "mqdefault"}.jpg`;
 }
 

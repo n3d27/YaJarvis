@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { icon, toast } from "#helpers/core.js";
-  import { music, playMusicQuery, subscribeMusic } from "#state/player.js";
+  import { SOURCE_LABELS, isExternal, music, playMusicQuery, subscribeMusic } from "#state/player.js";
   import styles from "./PlayerQueue.module.css";
 
   let state = $state.raw(null);
@@ -9,7 +9,7 @@
   let busy = $state(false);
   let disposed = false;
   let playing = $derived(!!(state?.playing || state?.paused));
-  let yandex = $derived(state?.source === "yandex");
+  let yandex = $derived(isExternal(state));
   let current = $derived(state?.track || {});
   let queued = $derived(state?.queue || 0);
   let next = $derived(yandex ? [] : state?.next || []);
@@ -96,7 +96,7 @@
   <div class="card-head">
     <h2 id="player-queue-title">Очередь</h2>
     {#if state}
-      <span class="meta">{yandex ? "Яндекс Музыка" : `${queued} в очереди${state.repeat ? " · повтор" : state.radio ? " · дальше похожее" : ""}`}</span>
+      <span class="meta">{yandex ? SOURCE_LABELS[state.source] : `${queued} в очереди${state.repeat ? " · повтор" : state.radio ? " · дальше похожее" : ""}`}</span>
     {/if}
   </div>
   <form class={styles.form} onsubmit={submit}>
@@ -122,7 +122,9 @@
       {/each}
     </ul>
   {/if}
-  {#if playing && yandex}
+  {#if playing && state?.source === "spotify"}
+    <p class="empty">Очередью Spotify управляет приложение: «Джарвис, следующий трек».</p>
+  {:else if playing && yandex}
     <p class="empty">Очередью Яндекс Музыки управляет Алиса: «Алиса, следующий трек», «Алиса, включи похожее».</p>
   {:else if !playing && !next.length}
     <p class="empty">{state ? "Очередь пуста. Найдите трек выше и нажмите «+» или скажите «Джарвис, добавь в очередь …»" : "Загружаю очередь…"}</p>

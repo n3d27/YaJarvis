@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { icon } from "#helpers/core.js";
-  import { artOf, clockStr, mountPlayback, mountVolume, musicAct, musicLink, setArt } from "#state/player.js";
+  import { SOURCE_LABELS, artOf, isExternal, clockStr, mountPlayback, mountVolume, musicAct, musicLink, setArt } from "#state/player.js";
   import styles from "./NowPlaying.module.css";
 
   let state = $state.raw(null);
@@ -17,11 +17,12 @@
 
   let track = $derived(state?.track || {});
   let active = $derived(!!(state?.playing || state?.paused));
-  let yandex = $derived(state?.source === "yandex");
-  let source = $derived(yandex ? "Яндекс Музыка" : "YouTube");
+  let spotify = $derived(state?.source === "spotify");
+  let external = $derived(isExternal(state));
+  let source = $derived(SOURCE_LABELS[state?.source] || "YouTube");
   let playback = $derived(active ? (state.paused ? "paused" : "playing") : state?.loading ? "loading" : "idle");
   let title = $derived(active ? track.Title || "…" : playback === "loading" ? "Ищу и включаю…" : "Ничего не играет");
-  let artist = $derived(active ? track.Author || source : "Скажите «Джарвис, включи с ютуба …» или попросите Алису");
+  let artist = $derived(active ? track.Author || source : "Скажите «Джарвис, включи …»");
   let kicker = $derived(active ? source + (state.paused ? " · пауза" : "") : playback === "loading" ? "YouTube · загрузка" : "Тишина");
   let image = $derived(active ? artOf(track, true, state) : "");
   let fallback = $derived(active ? artOf(track, false, state) : "");
@@ -76,10 +77,10 @@
       {/key}
       {#if active}
         <div class={styles.chips}>
-          <span class="chip">{yandex ? "через Алису" : "через Джарвиса"}</span>
+          <span class="chip">{spotify ? "через Спотифай" : external ? "через Алису" : "через Джарвиса"}</span>
           {#if state.album}<span class="chip">Альбом «{state.album}»</span>{/if}
-          {#if !yandex && state.radio}<span class="chip">радио</span>{/if}
-          {#if !yandex && state.repeat}<span class="chip">повтор</span>{/if}
+          {#if !external && state.radio}<span class="chip">радио</span>{/if}
+          {#if !external && state.repeat}<span class="chip">повтор</span>{/if}
         </div>
       {/if}
     </div>
@@ -91,7 +92,7 @@
     </div>
     <div class={styles.bar}>
       <div class={styles.actions}>
-        {#if !yandex}
+        {#if !external}
           <button class="cbtn" class:on={!!state?.radio} id="pl-radio" type="button" disabled={pending}
             data-tip="Радио: когда очередь кончится, играть похожее" aria-label="Радио" aria-pressed={!!state?.radio}
             onclick={(event) => control(event, "radio")}>{@html icon("radio")}</button>
@@ -100,23 +101,27 @@
           <button class="cbtn" type="button" disabled={pending} data-tip="Скопировать ссылку" aria-label="Скопировать ссылку"
             onclick={(event) => control(event, "copy")}>{@html icon("link")}</button>
           <a class="cbtn" href={link} target="_blank" rel="noopener" aria-label="Открыть в браузере"
-            data-tip={yandex ? "Открыть в Яндекс Музыке" : "Открыть на YouTube"}>{@html icon("ext")}</a>
+            data-tip={spotify ? "Открыть в Spotify" : external ? "Открыть в Яндекс Музыке" : "Открыть на YouTube"}>{@html icon("ext")}</a>
+        {/if}
+        {#if spotify}
+          <button class="cbtn" type="button" disabled={pending} data-tip="В любимые" aria-label="В любимые"
+            onclick={(event) => control(event, "like")}>♥</button>
         {/if}
       </div>
       <div class={styles.controls}>
         <button class="cbtn" type="button" disabled={!active || pending} data-tip="Выключить" aria-label="Выключить"
           onclick={(event) => control(event, "stop")}>{@html icon("stop", "solid")}</button>
-        <button class="cbtn" id="pl-prev" type="button" disabled={!active || pending || (!yandex && (state?.history?.length || 0) < 2)}
+        <button class="cbtn" id="pl-prev" type="button" disabled={!active || pending || (!external && (state?.history?.length || 0) < 2)}
           aria-label="Предыдущий" onclick={(event) => control(event, "prev")}>{@html icon("prev", "solid")}</button>
         <button class="cbtn big" id="pl-toggle" type="button" disabled={!active || pending}
           aria-label={playback === "playing" ? "Пауза" : "Продолжить"}
           onclick={(event) => control(event, "toggle")}>{@html icon(playback === "playing" ? "pause" : "play", "solid")}</button>
-        <button class="cbtn" id="pl-next" type="button" disabled={!active || pending || (!yandex && !state?.next?.length)}
+        <button class="cbtn" id="pl-next" type="button" disabled={!active || pending || (!external && !state?.next?.length)}
           aria-label="Следующий" onclick={(event) => control(event, "next")}>{@html icon("skip", "solid")}</button>
-        <button class="cbtn" class:on={!yandex && !!state?.repeat} id="pl-repeat" type="button"
-          disabled={!active || pending || yandex}
-          data-tip={yandex ? "Повтор доступен для YouTube" : state?.repeat ? "Повтор включён: этот трек по кругу" : "Повторять этот трек"}
-          aria-label="Повтор" aria-pressed={!yandex && !!state?.repeat}
+        <button class="cbtn" class:on={!external && !!state?.repeat} id="pl-repeat" type="button"
+          disabled={!active || pending || external}
+          data-tip={external ? "Повтор доступен для YouTube" : state?.repeat ? "Повтор включён: этот трек по кругу" : "Повторять этот трек"}
+          aria-label="Повтор" aria-pressed={!external && !!state?.repeat}
           onclick={(event) => control(event, "repeat")}>{@html icon("repeat")}</button>
       </div>
       <div class={styles.volume} class:hidden={level === null} id="np-vol" title="Громкость колонки">

@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { icon } from "#helpers/core.js";
-  import { artOf, clockStr, mountPlayback, musicAct, musicData, playMusicQuery, setArt } from "#state/player.js";
+  import { SOURCE_LABELS, artOf, isExternal, clockStr, mountPlayback, musicAct, musicData, playMusicQuery, setArt } from "#state/player.js";
 
   let state = $state.raw(null);
   let cover = $state();
@@ -13,11 +13,11 @@
 
   let track = $derived(state?.track || {});
   let active = $derived(!!(state?.playing || state?.paused));
-  let yandex = $derived(state?.source === "yandex");
-  let source = $derived(yandex ? "Яндекс Музыка" : "YouTube");
+  let external = $derived(isExternal(state));
+  let source = $derived(SOURCE_LABELS[state?.source] || "YouTube");
   let playback = $derived(active ? (state.paused ? "paused" : "playing") : state?.loading ? "loading" : "idle");
   let title = $derived(active ? track.Title || "…" : playback === "loading" ? "Ищу и включаю…" : "Тишина");
-  let artist = $derived(active ? track.Author || source : "Включите что-нибудь с YouTube или попросите Алису");
+  let artist = $derived(active ? track.Author || source : "Скажите «Джарвис, включи …»");
   let kicker = $derived(active ? source + (state.paused ? " · пауза" : "") : playback === "loading" ? "ищу…" : state ? "Плеер" : "");
   let image = $derived(active ? artOf(track, true, state) : "");
   let fallback = $derived(active ? artOf(track, false, state) : "");
@@ -76,13 +76,13 @@
     <button class="cbtn" type="button" data-m="stop" aria-label="Выключить" disabled={pending === "stop"}
       onclick={(event) => control(event, "stop")}>{@html icon("stop", "solid")}</button>
     <button class="cbtn" type="button" data-m="prev" id="np-prev" aria-label="Предыдущий"
-      disabled={pending === "prev" || (!yandex && (state?.history?.length || 0) < 2)}
+      disabled={pending === "prev" || (!external && (state?.history?.length || 0) < 2)}
       onclick={(event) => control(event, "prev")}>{@html icon("prev", "solid")}</button>
     <button class="cbtn big" type="button" data-m="toggle" id="np-toggle" disabled={pending === "toggle"}
       aria-label={state?.paused ? "Продолжить" : "Пауза"}
       onclick={(event) => control(event, "toggle")}>{@html icon(playback === "playing" ? "pause" : "play", "solid")}</button>
     <button class="cbtn" type="button" data-m="next" id="np-next" aria-label="Следующий"
-      disabled={pending === "next" || (!yandex && !state?.next?.length)}
+      disabled={pending === "next" || (!external && !state?.next?.length)}
       onclick={(event) => control(event, "next")}>{@html icon("skip", "solid")}</button>
     <button class="cbtn" type="button" data-m="copy" aria-label="Скопировать ссылку" disabled={pending === "copy"}
       onclick={(event) => control(event, "copy")}>{@html icon("link")}</button>
