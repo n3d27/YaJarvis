@@ -53,6 +53,9 @@ pub async fn check(State(app): State<App>) -> Response {
 }
 
 pub async fn install(State(app): State<App>) -> Response {
+    if crate::updates::locked(crate::version()) {
+        return bad("Сборка со Spotify: обновлять через build-jarvis.sh");
+    }
     if app.engine.talking() || app.engine.music.playing() {
         return bad("Остановите разговор и музыку перед обновлением");
     }
@@ -68,6 +71,9 @@ pub struct Upload {
 }
 
 pub async fn upload(State(app): State<App>, Query(input): Query<Upload>, data: Bytes) -> Response {
+    if crate::updates::locked(crate::version()) {
+        return bad("Сборка со Spotify: обновлять через build-jarvis.sh");
+    }
     if app.engine.talking() || app.engine.music.playing() {
         return bad("Остановите разговор и музыку перед обновлением");
     }
@@ -85,6 +91,9 @@ pub async fn upload(State(app): State<App>, Query(input): Query<Upload>, data: B
 }
 
 pub fn automatic(app: App) {
+    if crate::updates::locked(crate::version()) {
+        return;
+    }
     if !app.updater.can_self_update()
         || std::env::var_os("JARVIS_NO_AUTOUPDATE").is_some()
     {

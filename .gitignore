@@ -36,3 +36,6 @@ testdata/private/
 
 # Rust
 jarvis/target/
+
+# Custom build output
+out/

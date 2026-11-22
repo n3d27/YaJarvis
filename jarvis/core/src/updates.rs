@@ -13,6 +13,11 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 
+/// Custom builds (version contains `+spotify`) are never replaced by upstream releases.
+pub fn locked(version: &str) -> bool {
+    version.contains("+spotify")
+}
+
 #[derive(Deserialize)]
 struct Release {
     tag_name: String,
@@ -478,6 +483,12 @@ async fn identify(path: &Path) -> Result<Image, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_build_is_locked() {
+        assert!(locked("0.10.16+spotify"));
+        assert!(!locked("0.10.16"));
+        assert!(!locked("dev"));
+    }
     #[test]
     fn selects_only_the_exact_installed_module_set() {
         let mk = |arch: &str, bytes, ids: &[&str]| Build {
