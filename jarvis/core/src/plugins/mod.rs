@@ -205,6 +205,11 @@ impl Manifest {
 }
 
 /// a новее b (0.9.10 > 0.9.9; хвост «-rs» и т.п. не считается).
+/// Версия без суффиксов сборки (`0.10.16+spotify` -> `0.10.16`): так называются теги релизов.
+pub fn release_version(v: &str) -> &str {
+    v.split(['-', '+']).next().unwrap_or(v)
+}
+
 pub fn newer(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
         s.trim_start_matches('v').split(['-', '+']).next().unwrap_or("").split('.').map(|x| x.parse().unwrap_or(0)).collect()
@@ -1158,6 +1163,13 @@ pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_version_drops_build_suffixes() {
+        assert_eq!(release_version("0.10.16+spotify"), "0.10.16");
+        assert_eq!(release_version("0.10.16-rc1"), "0.10.16");
+        assert_eq!(release_version("0.10.16"), "0.10.16");
+        assert!(!newer(release_version("0.10.16+spotify"), "0.10.16"));
+    }
     use super::*;
 
     #[test]

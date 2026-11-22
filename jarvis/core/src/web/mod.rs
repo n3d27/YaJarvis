@@ -231,7 +231,7 @@ async fn guard(State(app): State<App>, ConnectInfo(peer): ConnectInfo<SocketAddr
     let set = |h: &mut axum::http::HeaderMap, k: &'static str, v: &'static str| {
         h.insert(k, HeaderValue::from_static(v));
     };
-    set(h, "content-security-policy", "default-src 'self'; img-src 'self' data: https://i.ytimg.com https://avatars.yandex.net; media-src 'self' blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    set(h, "content-security-policy", "default-src 'self'; img-src 'self' data: https://i.ytimg.com https://avatars.yandex.net https://i.scdn.co; media-src 'self' blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     set(h, "x-frame-options", "DENY");
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");

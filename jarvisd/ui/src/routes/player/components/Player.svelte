@@ -9,7 +9,7 @@
 
 <header class="ph">
   <h1>Плеер</h1>
-  <p class="sub">Всё, что играет на колонке: YouTube Джарвиса и Яндекс Музыка Алисы</p>
+  <p class="sub">Всё, что играет на колонке: Spotify, YouTube и Яндекс Музыка Алисы</p>
 </header>
 
 <NowPlaying />

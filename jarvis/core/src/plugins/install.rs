@@ -496,7 +496,7 @@ async fn download_official_rust(id: &str, tmp_path: &Path) -> Result<(), String>
     let base = if let Some(base) = option_env!("JARVIS_PLUGIN_ASSETS") {
         base.to_owned()
     } else {
-        let tag = format!("v{}", crate::version());
+        let tag = format!("v{}", super::release_version(crate::version()));
         format!("https://github.com/{}/releases/download/{tag}", crate::DEFAULT_REPO)
     };
     let sums = crate::net::download(&format!("{base}/SHA256SUMS"), 64 << 10).await

@@ -139,7 +139,7 @@ async fn fetch_official() -> Result<Vec<Value>, String> {
     if option_env!("JARVIS_PLUGIN_ASSETS").is_some() || crate::version() == "dev" {
         return fetch_index(&branch).await;
     }
-    let tag = official_url_at(&format!("v{}", crate::version()), "index.json");
+    let tag = official_url_at(&format!("v{}", super::release_version(crate::version())), "index.json");
     let (branch, release) = tokio::join!(fetch_index(&branch), fetch_index(&tag));
     match (branch, release) {
         (Ok(mut items), Ok(released)) => {
