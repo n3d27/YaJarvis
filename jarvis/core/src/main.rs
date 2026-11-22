@@ -303,15 +303,19 @@ async fn run(f: Flags, store: settings::Store) {
     tools.memory = Some(memory.clone());
     for (target, queue) in [(&mut tools.music, false), (&mut tools.music_queue, true)] {
         let (music, host) = (music.clone(), host.clone());
-        *target = Some(Arc::new(move |q| {
+        *target = Some(Arc::new(move |args: Value| {
             let (music, host) = (music.clone(), host.clone());
-            Box::pin(async move { music.play(&host, &q, queue).await })
+            Box::pin(async move {
+                let get = |k: &str, d: &str| args.get(k).and_then(Value::as_str).filter(|v| !v.trim().is_empty()).unwrap_or(d).to_string();
+                music.play_smart(&host, get("query", "").trim(), &get("source", "auto"), &get("kind", "any"), queue).await
+            })
         }));
     }
     tools.music_ctl = Some({
         let (music, host) = (music.clone(), host.clone());
-        Arc::new(move |text| {
+        Arc::new(move |args: Value| {
             let (music, host) = (music.clone(), host.clone());
+            let text = args.get("command").and_then(Value::as_str).unwrap_or("").to_string();
             Box::pin(async move { music.control(&host, &text).await.unwrap_or_else(|| "Сейчас музыка не играет или команда не распознана.".into()) })
         })
     });

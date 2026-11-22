@@ -168,7 +168,12 @@ pub fn alice_skill_for(text: &str, yandex_music: bool) -> Option<String> {
     if youtube_request(text) || clarification(text).is_some() {
         return None;
     }
-    alice_skill(text).filter(|b| yandex_music || !alice_music_request(b))
+    alice_skill(text).filter(|b| yandex_music || !(alice_music_request(b) || generic_play(b)))
+}
+
+/// «включи <что угодно>» без слов умного дома, таймеров и громкости: это просьба к Джарвису, не к Алисе.
+fn generic_play(bare: &str) -> bool {
+    MUSIC_PLAY.is_match(bare) && !NOT_MUSIC.is_match(bare) && !HOME_WORDS.is_match(bare) && classify_schedule(bare) == AliceSchedule::None
 }
 
 /// Короткая команда умного дома без обращения к каталогу устройств — её можно отдать Алисе целиком.
@@ -355,5 +360,25 @@ mod tests {
         assert!(!has_name("на улице сегодня жарко"));
         assert_eq!(command_after_lost_name("Сейчас отключи свет").as_deref(), Some("джарвис отключи свет"));
         assert_eq!(earcon(true).len(), 1120 + 1440 + 640 + 1600);
+    }
+
+    #[test]
+    fn music_never_goes_to_alice_without_yandex_music() {
+        for t in ["включи кино", "включи подкаст про космос", "поставь мою волну", "включи что-нибудь спокойное", "включи звуки дождя", "включи сказку"] {
+            assert!(alice_skill_for(t, false).is_none(), "{t}");
+        }
+        assert!(alice_skill_for("поставь таймер на 5 минут", false).is_some());
+        assert!(alice_skill_for("сделай громче", false).is_some());
+    }
+
+    #[test]
+    fn generic_vkluchi_filter_keeps_home_and_device_commands() {
+        // Как классифицировалось до фильтра, так и осталось.
+        for t in ["включи свет", "включи свет на кухне", "выключи свет", "включи телевизор", "включи розетку", "включи пылесос"] {
+            assert_eq!(alice_skill_for(t, false), alice_skill(t), "{t}");
+        }
+        assert!(alice_skill_for("включи будильник на 7", false).is_some());
+        assert!(alice_skill_for("включи будильник на 7", true).is_some());
+        assert!(alice_skill_for("включи таймер на 5 минут", false).is_some());
     }
 }

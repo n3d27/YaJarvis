@@ -6,7 +6,6 @@ use serde_json::Value;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)] // используется в задаче 4 (поиск)
 const CONF_PATH: &str = "/data/opt/soloist/spotify_api.conf";
 const CONTROL_SH: &str = "/data/opt/soloist/scripts/control.sh";
 const SOLOIST_BIN: &str = "/data/opt/soloist/bin/soloist";
@@ -55,7 +54,6 @@ impl SpotifyConf {
         c
     }
 
-    #[allow(dead_code)] // используется в задаче 4 (поиск)
     /// Читает конфиг колонки; при любой ошибке — пустой (поиск недоступен).
     pub fn load() -> SpotifyConf {
         std::fs::read_to_string(CONF_PATH).map(|t| SpotifyConf::parse(&t)).unwrap_or_default()
@@ -132,7 +130,6 @@ pub fn parse_now(json: &str) -> Option<SpotState> {
     })
 }
 
-#[allow(dead_code)] // используется в задаче 4 (поиск)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Any,
@@ -287,10 +284,8 @@ pub fn pick(query: &str, kind: Kind, search: &Value) -> Option<Pick> {
         .map(|c| Pick { uri: c.uri.clone(), label: c.label.clone() })
 }
 
-#[allow(dead_code)] // используется в задаче 4 (поиск)
 static TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
-#[allow(dead_code)] // используется в задаче 4 (поиск)
 async fn token(conf: &SpotifyConf) -> Result<String, String> {
     if let Some((t, exp)) = TOKEN.lock().unwrap().as_ref() {
         if Instant::now() < *exp {
@@ -315,7 +310,6 @@ async fn token(conf: &SpotifyConf) -> Result<String, String> {
     Ok(t)
 }
 
-#[allow(dead_code)] // используется в задаче 4 (поиск)
 fn search_types(kind: Kind) -> &'static str {
     match kind {
         Kind::Any => "track,artist,album,playlist",
@@ -327,7 +321,6 @@ fn search_types(kind: Kind) -> &'static str {
     }
 }
 
-#[allow(dead_code)] // используется в задаче 4 (поиск)
 /// Поиск в Spotify Web API (client credentials) и сверка. `Ok(None)` — ничего подходящего.
 pub async fn search(conf: &SpotifyConf, query: &str, kind: Kind) -> Result<Option<Pick>, String> {
     if !conf.can_search() {

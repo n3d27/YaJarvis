@@ -97,6 +97,66 @@ impl Default for Music {
     }
 }
 
+/// Куда вести просьбу включить музыку.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlayPlan {
+    /// Любимое / вперемешку / рекомендации Spotify (индекс в `LIKED`), без поиска.
+    Liked(usize),
+    /// YouTube сразу: `source=youtube` или очередь.
+    Youtube,
+    /// Spotify ничего не нашёл (или поиск недоступен): YouTube с пояснением.
+    YoutubeFallback,
+    Spotify(spotify::Pick),
+}
+
+/// (фраза для control.sh search, ответ).
+const LIKED: [(&str, &str); 3] = [
+    ("моё любимое", "Включил любимое в Spotify."),
+    ("любимое вперемешку", "Включил любимое вперемешку в Spotify."),
+    ("рекомендации", "Включил рекомендации в Spotify."),
+];
+
+pub fn plan(source: &str, kind: &str, queue: bool, found: Option<&spotify::Pick>) -> PlayPlan {
+    match kind {
+        "liked" => return PlayPlan::Liked(0),
+        "liked_shuffle" => return PlayPlan::Liked(1),
+        "wave" => return PlayPlan::Liked(2),
+        _ => {}
+    }
+    if source == "youtube" || queue {
+        return PlayPlan::Youtube;
+    }
+    match found {
+        Some(p) => PlayPlan::Spotify(p.clone()),
+        None => PlayPlan::YoutubeFallback,
+    }
+}
+
+/// Нужен ли поиск в Spotify для этой просьбы.
+pub fn wants_search(source: &str, kind: &str, queue: bool) -> bool {
+    plan(source, kind, queue, None) == PlayPlan::YoutubeFallback
+}
+
+fn spotify_kind(kind: &str) -> spotify::Kind {
+    match kind {
+        "track" => spotify::Kind::Track,
+        "artist" => spotify::Kind::Artist,
+        "album" => spotify::Kind::Album,
+        "playlist" => spotify::Kind::Playlist,
+        "podcast" => spotify::Kind::Podcast,
+        _ => spotify::Kind::Any,
+    }
+}
+
+/// Первая буква строчная (Unicode-безопасно).
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
 impl Music {
     fn set_remote(&self, next: Remote) {
         let playing = next.playing;
@@ -492,6 +552,56 @@ impl Music {
             ),
             Ok(v) => format!("Включил с YouTube: {}.", title(&v)),
             Err(e) => format!("Не получилось: {e}"),
+        }
+    }
+
+    /// Умный запуск: Spotify, при неудаче YouTube. liked/wave — только Spotify.
+    pub async fn play_smart(&self, host: &Host, query: &str, source: &str, kind: &str, queue: bool) -> String {
+        let mut found = None;
+        let mut searched = false;
+        if wants_search(source, kind, queue) {
+            let conf = spotify::SpotifyConf::load();
+            if conf.can_search() {
+                searched = true;
+                match spotify::search(&conf, query, spotify_kind(kind)).await {
+                    Ok(p) => found = p,
+                    Err(e) => log::warn!("spotify: поиск не удался: {e}"),
+                }
+            }
+        }
+        match plan(source, kind, queue, found.as_ref()) {
+            PlayPlan::Liked(i) => {
+                let (phrase, answer) = LIKED[i];
+                self.stop_youtube(host).await;
+                match spotify::ctl(&["search", phrase]).await {
+                    Ok(()) => answer.to_string(),
+                    Err(e) => format!("Не получилось включить в Spotify: {e}"),
+                }
+            }
+            PlayPlan::Youtube => {
+                self.yield_spotify().await;
+                self.play(host, query, queue).await
+            }
+            PlayPlan::Spotify(pick) => {
+                self.stop_youtube(host).await;
+                match spotify::ctl(&["play", &pick.uri]).await {
+                    Ok(()) => format!("Включил в Spotify: {}.", pick.label),
+                    Err(e) => {
+                        log::warn!("spotify: play не удался: {e}");
+                        format!("В Spotify не получилось, {}", lower_first(&self.play(host, query, false).await))
+                    }
+                }
+            }
+            PlayPlan::YoutubeFallback => {
+                let reply = self.play(host, query, false).await;
+                if searched { format!("В Spotify не нашёл, {}", lower_first(&reply)) } else { reply }
+            }
+        }
+    }
+
+    async fn stop_youtube(&self, host: &Host) {
+        if self.state().playing {
+            let _ = self.call(host, "stop", Value::Null).await;
         }
     }
 
@@ -1068,5 +1178,29 @@ mod tests {
         assert_eq!(command("не нравится эта песня").unwrap().0, "unlike");
         assert_eq!(command("не нравится эту песню").unwrap().0, "unlike");
         assert_eq!(command("включи вперемешку").unwrap().0, "shuffle");
+    }
+
+    fn pk() -> spotify::Pick { spotify::Pick { uri: "spotify:track:X".into(), label: "Кино".into() } }
+
+    #[test]
+    fn plan_routes() {
+        assert_eq!(plan("auto", "liked", false, None), PlayPlan::Liked(0));
+        assert_eq!(plan("youtube", "liked_shuffle", true, None), PlayPlan::Liked(1));
+        assert_eq!(plan("auto", "wave", false, None), PlayPlan::Liked(2));
+        assert_eq!(plan("youtube", "any", false, None), PlayPlan::Youtube);
+        assert_eq!(plan("auto", "any", true, None), PlayPlan::Youtube);
+        assert_eq!(plan("auto", "any", false, None), PlayPlan::YoutubeFallback);
+        assert_eq!(plan("auto", "any", false, Some(&pk())), PlayPlan::Spotify(pk()));
+        assert_eq!(plan("spotify", "track", false, Some(&pk())), PlayPlan::Spotify(pk()));
+        assert!(wants_search("auto", "any", false));
+        assert!(!wants_search("youtube", "any", false));
+        assert!(!wants_search("auto", "liked", false));
+    }
+
+    #[test]
+    fn lowercase_first_is_unicode_safe() {
+        assert_eq!(lower_first("Включил с YouTube: X."), "включил с YouTube: X.");
+        assert_eq!(lower_first("Éa"), "éa");
+        assert_eq!(lower_first(""), "");
     }
 }

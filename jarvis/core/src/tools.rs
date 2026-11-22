@@ -14,7 +14,8 @@ fn def(name: &str) -> Value {
     DEFS.get(name).cloned().unwrap_or(Value::Null)
 }
 
-pub type MusicFn = Arc<dyn Fn(String) -> crate::plugins::BoxFut<String> + Send + Sync>;
+/// Принимает JSON-аргументы вызова инструмента.
+pub type MusicFn = Arc<dyn Fn(Value) -> crate::plugins::BoxFut<String> + Send + Sync>;
 pub type MusicFastFn=Arc<dyn Fn(String)->crate::plugins::BoxFut<Option<String>>+Send+Sync>;
 
 pub struct Tools {
@@ -31,6 +32,18 @@ pub struct Tools {
     pub music_cancel: Option<Arc<dyn Fn() -> crate::plugins::BoxFut<()> + Send + Sync>>,
     /// Общая память: «вспомни», «забудь/запомни».
     pub memory: Option<Arc<crate::memory::Memory>>,
+}
+
+pub(crate) fn play_music_def(who: &str) -> Value {
+    json!({"type": "function", "name": "play_music",
+        "description": format!("Включить музыку, подкаст или видео на колонке. По умолчанию ищет в Spotify, при неудаче — на YouTube. source=youtube — для видео: обзоры, ролики, концерты, каверы, «на ютубе». kind=liked/liked_shuffle/wave — «моё любимое», «любимое вперемешку», «рекомендации/моя волна». {who} Если сказали только «включи на YouTube трек», сначала спроси название или исполнителя. Подбирай сам, когда об этом попросили. Не обещай «сейчас поищу» без вызова."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "что искать: исполнитель и название"},
+            "source": {"type": "string", "enum": ["auto", "spotify", "youtube"], "description": "auto (по умолчанию) — сначала Spotify, потом YouTube; youtube — видео и ролики"},
+            "kind": {"type": "string", "enum": ["any", "track", "artist", "album", "playlist", "podcast", "liked", "liked_shuffle", "wave"], "description": "что искать; liked — моё любимое, liked_shuffle — любимое вперемешку, wave — рекомендации/моя волна (query можно не заполнять)"},
+            "queue": {"type": "boolean", "description": "true — не включать сразу, а добавить в очередь YouTube после того, что играет («добавь в очередь», «потом включи»)"},
+            "keep_talking": {"type": "boolean", "description": "true — если кроме включения музыки хозяин попросил ещё о чём-то (ответить на вопрос, рассказать, не отключаться)"}},
+            "required": ["query"]}})
 }
 
 const DAYS: [&str; 7] = ["воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"];
@@ -212,13 +225,7 @@ impl Tools {
             } else {
                 "Яндекс Музыка выключена в настройках: любую музыку, песню или радио включай только этим инструментом, сразу, запрос придумай сам, если не назвали."
             };
-            defs.push(json!({"type": "function", "name": "play_music",
-                "description": format!("Найти по всему YouTube и включить звук видео на колонке: любой ролик, кавер, ремикс, концерт, подкаст или песню. {who} Если сказали только «включи на YouTube трек», сначала спроси название или исполнителя. Подбирай сам, когда об этом попросили. Не обещай «сейчас поищу» без вызова."),
-                "parameters": {"type": "object", "properties": {
-                    "query": {"type": "string", "description": "что искать: исполнитель и название"},
-                    "queue": {"type": "boolean", "description": "true — не включать сразу, а добавить в очередь после того, что играет («добавь в очередь», «потом включи»)"},
-                    "keep_talking": {"type": "boolean", "description": "true — если кроме включения музыки хозяин попросил ещё о чём-то (ответить на вопрос, рассказать, не отключаться)"}},
-                    "required": ["query"]}}));
+            defs.push(play_music_def(who));
         }
         if self.music_ctl.is_some() && self.host.provider("youtube").is_ok() {
             defs.push(json!({"type": "function", "name": "music_control",
@@ -262,16 +269,18 @@ impl Tools {
         if name == "play_music"
             && let Some(m) = &self.music
         {
-            let q = field("query");
-            if q.is_empty() {
+            let kind = field("kind");
+            let liked = matches!(kind.as_str(), "liked" | "liked_shuffle" | "wave");
+            if field("query").is_empty() && !liked {
                 return "Не понял, что включить.".into();
             }
             if a.get("queue").and_then(Value::as_bool) == Some(true)
+                && !liked
                 && let Some(mq) = &self.music_queue
             {
-                return mq(q).await;
+                return mq(a.clone()).await;
             }
-            return m(q).await;
+            return m(a.clone()).await;
         }
         if name == "music_control"
             && let Some(m) = &self.music_ctl
@@ -280,7 +289,7 @@ impl Tools {
             if c.is_empty() {
                 return "Не понял команду для музыки.".into();
             }
-            return m(c).await;
+            return m(json!({"command": c})).await;
         }
         if let Some(m) = &self.memory {
             if name == "recall_conversation" {
@@ -302,6 +311,9 @@ impl Tools {
             }
             if let Some(question) = fastcmd::clarification(&cmd) {
                 return question.into();
+            }
+            if !self.use_ch("yandexmusic") && fastcmd::alice_music_request(&fastcmd::strip_lead(&fastcmd::norm_text(&cmd))) {
+                return "Для музыки вызови play_music.".into();
             }
             if fastcmd::youtube_request(&cmd) {
                 return if self.host.provider("youtube").is_ok() {
@@ -349,5 +361,19 @@ mod tests {
         for n in ["home_assistant", "xiaomi_home", "smart_life", "alice_command", "smart_home", "recall_conversation", "edit_memory"] {
             assert_eq!(super::def(n)["name"], n, "{n}");
         }
+    }
+
+    #[test]
+    fn play_music_schema_has_source_and_kind() {
+        let d = super::play_music_def("");
+        assert_eq!(d["name"], "play_music");
+        let p = &d["parameters"]["properties"];
+        assert_eq!(p["source"]["enum"], serde_json::json!(["auto", "spotify", "youtube"]));
+        let kinds = p["kind"]["enum"].as_array().unwrap();
+        for k in ["any", "liked", "liked_shuffle", "wave", "podcast"] {
+            assert!(kinds.iter().any(|v| v == k), "{k}");
+        }
+        assert!(p["queue"].is_object() && p["keep_talking"].is_object());
+        assert_eq!(d["parameters"]["required"], serde_json::json!(["query"]));
     }
 }
