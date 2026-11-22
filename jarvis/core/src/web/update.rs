@@ -90,10 +90,12 @@ pub async fn upload(State(app): State<App>, Query(input): Query<Upload>, data: B
     }
 }
 
+/// Сборка со Spotify не заменяет себя сама: проверка релизов остаётся, установка нет.
+fn core_install_allowed(version: &str) -> bool {
+    !crate::updates::locked(version)
+}
+
 pub fn automatic(app: App) {
-    if crate::updates::locked(crate::version()) {
-        return;
-    }
     if !app.updater.can_self_update()
         || std::env::var_os("JARVIS_NO_AUTOUPDATE").is_some()
     {
@@ -126,7 +128,7 @@ pub fn automatic(app: App) {
                     let _ = app.updater.check().await;
                 }
                 if auto && (3..6).contains(&now.hour()) && super::plugins::idle(&app) {
-                    let installing_core = app.updater.available() && app.updater.install_build(None).await.is_ok();
+                    let installing_core = core_install_allowed(crate::version()) && app.updater.available() && app.updater.install_build(None).await.is_ok();
                     if !installing_core && plugins_checked != Some(now.date()) && super::plugins::automatic(&app).await {
                         plugins_checked = Some(now.date());
                     }
@@ -135,4 +137,15 @@ pub fn automatic(app: App) {
             tokio::time::sleep(Duration::from_secs(20 * 60)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::core_install_allowed;
+
+    #[test]
+    fn automatic_install_is_blocked_only_for_the_spotify_build() {
+        assert!(!core_install_allowed("0.10.16+spotify"));
+        assert!(core_install_allowed("0.10.16"));
+    }
 }
