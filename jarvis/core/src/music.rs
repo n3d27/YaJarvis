@@ -1,5 +1,10 @@
 //! Общий интерфейс музыки. Поиск, аккаунт и декодирование принадлежат модулю-провайдеру.
-use crate::{alice_music::AliceMusic, fastcmd, plugins::Host};
+use crate::{
+    alice_music::AliceMusic,
+    fastcmd,
+    plugins::Host,
+    spotify::{self, SpotState},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -21,9 +26,52 @@ pub struct Remote {
     pub status: String,
 }
 
+/// Как долго пауза источника ещё считается «последней».
+const PAUSE_FRESH: Duration = Duration::from_secs(30 * 60);
+/// Сколько подряд неудачных опросов Soloist нужно, чтобы забыть состояние Spotify.
+const SPOT_MAX_FAILS: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Youtube,
+    Alice,
+    Spotify,
+}
+
+/// Кто сейчас владеет управлением: играющий источник, иначе последний на паузе (не старше 30 мин), иначе YouTube.
+pub fn active_source(yt: &Remote, alice_active: bool, alice_playing: bool, sp: &SpotState, sp_paused_at: Option<Instant>) -> Source {
+    if sp.status == "playing" {
+        return Source::Spotify;
+    }
+    if yt.playing {
+        return Source::Youtube;
+    }
+    if alice_active && alice_playing {
+        return Source::Alice;
+    }
+    if sp.status == "paused" && sp_paused_at.is_some_and(|t| t.elapsed() < PAUSE_FRESH) {
+        return Source::Spotify;
+    }
+    if alice_active && !yt.active {
+        return Source::Alice;
+    }
+    Source::Youtube
+}
+
+/// Последнее известное состояние Spotify (по опросу Soloist) и служебные отметки времени.
+#[derive(Default)]
+pub struct SpotTrack {
+    pub state: SpotState,
+    pub paused_at: Option<Instant>,
+    pub last_playing: Option<Instant>,
+    pub updated: Option<Instant>,
+    fails: u8,
+}
+
 pub struct Music {
     state: Mutex<Remote>,
     pub alice: Mutex<AliceMusic>,
+    pub spotify: Mutex<SpotTrack>,
     button: Mutex<Button>,
     cancel: tokio::sync::watch::Sender<u64>,
     playing_tx: tokio::sync::watch::Sender<bool>,
@@ -39,6 +87,7 @@ impl Default for Music {
         Self {
             state: Mutex::default(),
             alice: Mutex::default(),
+            spotify: Mutex::default(),
             button: Mutex::default(),
             cancel: tokio::sync::watch::channel(0).0,
             playing_tx: tokio::sync::watch::channel(false).0,
@@ -50,6 +99,10 @@ impl Music {
     fn set_remote(&self, next: Remote) {
         let playing = next.playing;
         *self.state.lock().unwrap() = next;
+        if playing {
+            // YouTube заиграл позже — пауза Spotify больше не «последняя»
+            self.spotify.lock().unwrap().paused_at = None;
+        }
         let _ = self.playing_tx.send_if_modified(|cur| {
             if *cur == playing {
                 false
@@ -65,13 +118,161 @@ impl Music {
     }
 
     pub fn playing(&self) -> bool {
-        self.state.lock().unwrap().playing || self.alice.lock().unwrap().playing()
+        self.state.lock().unwrap().playing || self.alice.lock().unwrap().playing() || self.spotify.lock().unwrap().state.status == "playing"
+    }
+
+    pub fn source(&self) -> Source {
+        let youtube = self.state.lock().unwrap();
+        let alice = self.alice.lock().unwrap();
+        let sp = self.spotify.lock().unwrap();
+        active_source(&youtube, alice.active(), alice.playing(), &sp.state, sp.paused_at)
     }
 
     fn use_alice(&self) -> bool {
-        let youtube = self.state.lock().unwrap();
-        let alice = self.alice.lock().unwrap();
-        !youtube.playing && alice.active() && (alice.playing() || !youtube.active)
+        self.source() == Source::Alice
+    }
+
+    /// Состояние Spotify с позицией, досчитанной до текущего момента.
+    fn spotify_current(&self) -> SpotState {
+        let sp = self.spotify.lock().unwrap();
+        let mut st = sp.state.clone();
+        if st.status == "playing" && let Some(at) = sp.updated {
+            st.pos_ms += at.elapsed().as_millis() as u64;
+            if st.dur_ms > 0 { st.pos_ms = st.pos_ms.min(st.dur_ms); }
+        }
+        st
+    }
+
+    pub fn spotify_snapshot(st: &SpotState) -> Value {
+        let mut parts = st.uri.split(':');
+        let link = match (parts.next(), parts.next(), parts.next()) {
+            (Some("spotify"), Some(kind), Some(id)) if !id.is_empty() => format!("https://open.spotify.com/{kind}/{id}"),
+            _ => String::new(),
+        };
+        json!({"source":"spotify", "playing":st.status == "playing", "paused":st.status != "playing",
+            "track":{"ID":st.uri,"Title":st.title,"Author":st.artists},
+            "pos":st.pos_ms as f64 / 1000.0, "dur":st.dur_ms as f64 / 1000.0, "cover":st.cover,
+            "album":st.album, "link":link, "shuffle":st.shuffle})
+    }
+
+    /// Применяет результат опроса Soloist. `true` — Spotify только что перешёл в `playing`.
+    fn set_spotify(&self, next: Option<SpotState>) -> bool {
+        let mut sp = self.spotify.lock().unwrap();
+        let next = next.filter(|n| !n.status.is_empty());
+        let Some(next) = next else {
+            sp.fails = sp.fails.saturating_add(1);
+            if sp.fails >= SPOT_MAX_FAILS && !sp.state.status.is_empty() {
+                sp.state = SpotState::default();
+                sp.paused_at = None;
+            }
+            return false;
+        };
+        sp.fails = 0;
+        let was = sp.state.status.clone();
+        let now = Instant::now();
+        let started = next.status == "playing" && was != "playing";
+        if next.status == "playing" {
+            sp.last_playing = Some(now);
+            sp.paused_at = None;
+        } else if was == "playing" {
+            sp.paused_at = Some(now);
+        }
+        sp.state = next;
+        sp.updated = Some(now);
+        started
+    }
+
+    /// Оптимистичная отметка после команды, пока опрос не подтвердил.
+    fn mark_spotify(&self, status: &str) {
+        let mut sp = self.spotify.lock().unwrap();
+        if sp.state.uri.is_empty() { return; }
+        let was = std::mem::replace(&mut sp.state.status, status.to_string());
+        sp.updated = Some(Instant::now());
+        if status == "playing" {
+            sp.paused_at = None;
+            sp.last_playing = sp.updated;
+        } else if was == "playing" {
+            sp.paused_at = sp.updated;
+        }
+    }
+
+    fn spotify_playing(&self) -> bool {
+        self.spotify.lock().unwrap().state.status == "playing"
+    }
+
+    /// Другой источник собирается играть — Spotify уступает.
+    async fn yield_spotify(&self) {
+        if self.spotify_playing() {
+            let _ = spotify::ctl(&["pause"]).await;
+            self.mark_spotify("paused");
+        }
+    }
+
+    /// Spotify заиграл (по опросу): YouTube и Алиса молчат.
+    pub async fn on_spotify_started(&self, host: &Host) {
+        if self.state().playing {
+            let _ = self.call(host, "stop", Value::Null).await;
+        }
+        if self.alice.lock().unwrap().playing() {
+            let _ = self.alice_control("pause", &Value::Null).await;
+        }
+    }
+
+    /// Опрос Soloist: раз в секунду, пока Spotify играл в последние 30 минут, иначе раз в 5 секунд.
+    pub async fn spotify_poll_loop(self: Arc<Self>, host: Arc<Host>) {
+        loop {
+            let st = spotify::now().await;
+            let before = self.spotify.lock().unwrap().state.status.clone();
+            let started = self.set_spotify(st);
+            let after = self.spotify.lock().unwrap().state.status.clone();
+            if before != after {
+                log::info!("spotify: {} -> {}", if before.is_empty() { "idle" } else { &before }, if after.is_empty() { "idle" } else { &after });
+            }
+            if started {
+                self.on_spotify_started(&host).await;
+            }
+            let hot = {
+                let sp = self.spotify.lock().unwrap();
+                sp.state.status == "playing" || sp.last_playing.is_some_and(|t| t.elapsed() < PAUSE_FRESH)
+            };
+            tokio::time::sleep(Duration::from_secs(if hot { 1 } else { 5 })).await;
+        }
+    }
+
+    async fn spotify_control(&self, op: &str, args: &Value) -> Result<(), String> {
+        match op {
+            "pause" | "stop" => {
+                spotify::ctl(&["pause"]).await?;
+                self.mark_spotify("paused");
+            }
+            "resume" => {
+                spotify::ctl(&["play"]).await?;
+                self.mark_spotify("playing");
+            }
+            "next" | "related" => spotify::ctl(&["next"]).await?,
+            "prev" => spotify::ctl(&["prev"]).await?,
+            "like" => spotify::ctl(&["like"]).await?,
+            "unlike" => spotify::ctl(&["unlike"]).await?,
+            "shuffle" => spotify::ctl(&["shuffle", if args["on"].as_bool().unwrap_or(false) { "on" } else { "off" }]).await?,
+            "repeat" => spotify::ctl(&["repeat", if args["on"].as_bool().unwrap_or(false) { "track" } else { "off" }]).await?,
+            "seek" => {
+                let cur = self.spotify_current();
+                let ms = seek_target_ms(cur.pos_ms, cur.dur_ms, args["delta"].as_f64().unwrap_or(0.0), args["abs"].as_bool().unwrap_or(false));
+                spotify::seek(ms).await?;
+            }
+            _ => return Err("эта команда не поддерживается для Spotify".into()),
+        }
+        Ok(())
+    }
+
+    fn spotify_description(&self) -> String {
+        let st = self.spotify_current();
+        let action = if st.status == "playing" { "Играет" } else { "На паузе" };
+        if st.artists.is_empty() {
+            format!("{action} «{}».", st.title)
+        } else {
+            format!("{action} «{}» — {}.", st.title, st.artists)
+        }
     }
 
     pub async fn alice_control(&self, op: &str, args: &Value) -> Result<(), String> {
@@ -81,6 +282,16 @@ impl Music {
     }
 
     pub async fn transport(&self, host: &Host, op: &str, args: Value) -> Result<(), String> {
+        let source = self.source();
+        if source == Source::Spotify && matches!(op, "pause" | "resume" | "next" | "prev" | "stop" | "seek" | "related" | "like" | "unlike" | "shuffle" | "repeat") {
+            return self.spotify_control(op, &args).await;
+        }
+        if matches!(op, "like" | "unlike" | "shuffle") {
+            return Err("Это работает только в Spotify.".into());
+        }
+        if matches!(op, "play" | "play_id") {
+            self.yield_spotify().await;
+        }
         if self.use_alice() && matches!(op, "pause" | "resume" | "next" | "prev" | "stop" | "seek" | "related") {
             self.alice_control(op, &args).await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -93,7 +304,7 @@ impl Music {
         let stop_alice = self.alice.lock().unwrap().active();
         let _ = tokio::join!(self.call(host, "stop", Value::Null), async {
             if stop_alice { let _ = self.alice_control("stop", &Value::Null).await; }
-        });
+        }, self.yield_spotify());
     }
 
     pub async fn cancel_loading(&self, host: &Host) {
@@ -120,6 +331,7 @@ impl Music {
         } else if self.state().playing {
             let _ = self.call(host, "pause", Value::Null).await;
         }
+        self.yield_spotify().await;
     }
 
     pub async fn pause_button(&self, host: &Host) {
@@ -225,16 +437,26 @@ impl Music {
                 json!({"source":"youtube", "playing":s.playing,"paused":s.paused,"repeat":s.repeat,"track":s.cur,"pos":s.pos})
             }
         };
-        if self.use_alice() {
-            let mut alice = self.alice.lock().unwrap().snapshot();
-            alice["history"] = youtube["history"].clone();
-            return alice;
+        match self.source() {
+            Source::Alice => {
+                let mut alice = self.alice.lock().unwrap().snapshot();
+                alice["history"] = youtube["history"].clone();
+                alice
+            }
+            Source::Spotify => {
+                let mut sp = Self::spotify_snapshot(&self.spotify_current());
+                sp["history"] = youtube["history"].clone();
+                sp
+            }
+            Source::Youtube => youtube,
         }
-        youtube
     }
 
     pub async fn play(&self, host: &Host, query: &str, queue: bool) -> String {
         let propose = recommendation(query);
+        if !queue && !propose {
+            self.yield_spotify().await;
+        }
         let result = self
             .call(
                 host,
@@ -260,6 +482,14 @@ impl Music {
 
     pub async fn control(&self, host: &Host, text: &str) -> Option<String> {
         let command = command(text);
+        if self.source() == Source::Spotify && let Some((op, args, answer)) = &command {
+            if *op == "status" { return Some(self.spotify_description()); }
+            return Some(match self.spotify_control(op, args).await {
+                Ok(()) if *op == "related" => "Переключаю трек.".into(),
+                Ok(()) => (*answer).into(),
+                Err(e) => format!("Не получилось: {e}"),
+            });
+        }
         if self.use_alice() && let Some((op, args, answer)) = &command {
             if *op == "status" { return Some(self.alice.lock().unwrap().description()); }
             return Some(match self.alice_control(op, args).await {
@@ -283,6 +513,9 @@ impl Music {
         let (op, args, answer) = command?;
         if op == "status" {
             return Some(self.state().status);
+        }
+        if matches!(op, "like" | "unlike" | "shuffle") {
+            return Some("Это работает только в Spotify.".into());
         }
         Some(match self.call(host, op, args).await {
             Err(e) => format!("Не получилось: {e}"),
@@ -358,6 +591,18 @@ pub fn command(text: &str) -> Option<(&'static str, Value, &'static str)> {
     ]) {
         return simple("status", "");
     }
+    if starts(&["дизлайк", "не нравится", "убери из любимых", "убери лайк", "удали из любимых"]) {
+        return simple("unlike", "Убрал из любимых.");
+    }
+    if starts(&["лайк", "нравится", "добавь в любимые", "поставь лайк"]) {
+        return simple("like", "Добавил в любимые.");
+    }
+    if starts(&["не перемешивай", "по порядку", "выключи перемешивание", "отключи перемешивание"]) {
+        return Some(("shuffle", json!({"on": false}), "Играю по порядку."));
+    }
+    if starts(&["перемешай", "вперемешку", "включи перемешивание"]) {
+        return Some(("shuffle", json!({"on": true}), "Перемешиваю."));
+    }
     if starts(&["сначала", "с начала", "в начало", "включи сначала"])
     {
         return Some(("seek", json!({"delta":0,"abs":true}), "С начала."));
@@ -427,6 +672,14 @@ pub fn command(text: &str) -> Option<(&'static str, Value, &'static str)> {
         return Some(("related", json!({"expected":""}), ""));
     }
     None
+}
+
+/// Новая позиция Spotify в мс: абсолютная или относительная, в пределах трека.
+fn seek_target_ms(pos_ms: u64, dur_ms: u64, delta: f64, abs: bool) -> u64 {
+    let base = if abs { 0.0 } else { pos_ms as f64 };
+    let mut ms = (base + delta * 1000.0).max(0.0) as u64;
+    if dur_ms > 0 { ms = ms.min(dur_ms.saturating_sub(500)); }
+    ms
 }
 
 fn seek(t: &str) -> (f64, bool) {
@@ -702,5 +955,54 @@ mod tests {
         tr_multi.observe_tool("play_music", r#"{"query":"Сало"}"#, "Включил с YouTube: Сало.");
         tr_multi.observe_tool("smart_home", r#"{"on":false}"#, "Готово.");
         assert!(!tr_multi.should_close("Включил Сало и выключил свет."));
+    }
+
+    fn sp(status: &str) -> SpotState { SpotState { status: status.into(), uri: "spotify:track:X".into(), ..Default::default() } }
+
+    #[test] fn spotify_playing_wins() { let sp = SpotState{status:"playing".into(), ..Default::default()}; assert!(matches!(active_source(&Remote::default(), false, false, &sp, None), Source::Spotify)); }
+    #[test] fn youtube_playing_beats_paused_spotify() { let yt = Remote{playing:true, active:true, ..Default::default()}; let sp = SpotState{status:"paused".into(), ..Default::default()}; assert!(matches!(active_source(&yt, false, false, &sp, Some(Instant::now())), Source::Youtube)); }
+    #[test] fn stale_spotify_pause_is_ignored() { let sp = SpotState{status:"paused".into(), ..Default::default()}; let old = Instant::now() - Duration::from_secs(31*60); assert!(matches!(active_source(&Remote::default(), false, false, &sp, Some(old)), Source::Youtube)); }
+    #[test] fn like_phrases_parse() { assert_eq!(command("лайк").unwrap().0, "like"); assert_eq!(command("убери из любимых").unwrap().0, "unlike"); assert!(command("что такое лайк в тиктоке").is_none()); }
+    #[test] fn spotify_snapshot_shape() { let s = SpotState{status:"playing".into(), uri:"spotify:track:X".into(), title:"T".into(), artists:"A".into(), pos_ms:1500, dur_ms:3000, ..Default::default()}; let v = Music::spotify_snapshot(&s); assert_eq!(v["source"],"spotify"); assert_eq!(v["pos"],1.5); assert_eq!(v["link"],"https://open.spotify.com/track/X"); }
+
+    #[test]
+    fn fresh_spotify_pause_owns_controls_until_youtube_plays() {
+        let m = Music::default();
+        assert!(m.set_spotify(Some(sp("playing"))));
+        assert!(m.playing());
+        assert_eq!(m.source(), Source::Spotify);
+        assert!(!m.set_spotify(Some(sp("paused"))));
+        assert!(!m.playing());
+        assert_eq!(m.source(), Source::Spotify);
+        m.event("music.state", json!({"playing":true,"active":true}));
+        assert_eq!(m.source(), Source::Youtube);
+        m.event("music.state", json!({"paused":true,"active":true}));
+        assert_eq!(m.source(), Source::Youtube);
+    }
+
+    #[test]
+    fn spotify_start_is_reported_once_and_failures_clear_state() {
+        let m = Music::default();
+        assert!(m.set_spotify(Some(sp("playing"))));
+        assert!(!m.set_spotify(Some(sp("playing"))));
+        assert!(!m.set_spotify(None));
+        assert!(!m.set_spotify(None));
+        assert_eq!(m.source(), Source::Spotify);
+        m.set_spotify(None);
+        assert_eq!(m.source(), Source::Youtube);
+        assert!(!m.playing());
+    }
+
+    #[test]
+    fn spotify_commands_and_seek_math() {
+        assert_eq!(command("перемешай").unwrap().1, json!({"on": true}));
+        assert_eq!(command("не перемешивай").unwrap().1, json!({"on": false}));
+        assert_eq!(command("по порядку").unwrap().0, "shuffle");
+        assert_eq!(command("не нравится").unwrap().0, "unlike");
+        assert_eq!(command("добавь в любимые").unwrap().0, "like");
+        assert_eq!(seek_target_ms(10_000, 200_000, -30.0, false), 0);
+        assert_eq!(seek_target_ms(10_000, 200_000, 20.0, false), 30_000);
+        assert_eq!(seek_target_ms(10_000, 200_000, 125.0, true), 125_000);
+        assert_eq!(seek_target_ms(10_000, 200_000, 999.0, true), 199_500);
     }
 }

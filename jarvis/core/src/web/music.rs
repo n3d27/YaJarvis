@@ -14,7 +14,11 @@ pub async fn post(State(app): State<App>, Json(v): Json<Value>) -> Response {
         "play" => ("play", json!({"query":query})),
         "id" if !query.is_empty() => ("play_id", json!({"id":query})),
         "queue" => ("enqueue", json!({"query":query})),
-        "pause" | "resume" | "next" | "prev" | "stop" => (action, Value::Null),
+        "pause" | "resume" | "next" | "prev" | "stop" | "like" | "unlike" => (action, Value::Null),
+        "shuffle" => match v["on"].as_bool() {
+            Some(on) => ("shuffle", json!({"on": on})),
+            None => return bad("Нужно указать on"),
+        },
         "seek" => match v["sec"].as_f64().filter(|s| s.is_finite() && *s >= 0.0) {
             Some(sec) => ("seek", json!({"delta":sec,"abs":true})),
             None => return bad("Неверная позиция"),

@@ -342,6 +342,7 @@ async fn run(f: Flags, store: settings::Store) {
     let _ = engine_cell.set(Arc::downgrade(&engine));
     {
         let e = Arc::downgrade(&engine);
+        tokio::spawn(music.clone().spotify_poll_loop(host.clone()));
         music::volume_loop(music, host.clone(), move || e.upgrade().is_some_and(|e| e.talking() || e.player.playing()));
     }
     memory.set_summarizer(Some(engine.summarizer()));

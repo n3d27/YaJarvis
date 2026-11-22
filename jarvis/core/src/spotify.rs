@@ -1,4 +1,3 @@
-#![allow(dead_code)] // подключается к music.rs в следующих задачах
 //! Spotify как источник музыки: конфиг ключей, состояние Soloist, поиск Web API и сверка результата с запросом.
 //! Ключи и токены нигде не логируются.
 
@@ -7,6 +6,7 @@ use serde_json::Value;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)] // используется в задаче 4 (поиск)
 const CONF_PATH: &str = "/data/opt/soloist/spotify_api.conf";
 const CONTROL_SH: &str = "/data/opt/soloist/scripts/control.sh";
 const SOLOIST_BIN: &str = "/data/opt/soloist/bin/soloist";
@@ -55,6 +55,7 @@ impl SpotifyConf {
         c
     }
 
+    #[allow(dead_code)] // используется в задаче 4 (поиск)
     /// Читает конфиг колонки; при любой ошибке — пустой (поиск недоступен).
     pub fn load() -> SpotifyConf {
         std::fs::read_to_string(CONF_PATH).map(|t| SpotifyConf::parse(&t)).unwrap_or_default()
@@ -131,6 +132,7 @@ pub fn parse_now(json: &str) -> Option<SpotState> {
     })
 }
 
+#[allow(dead_code)] // используется в задаче 4 (поиск)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Any,
@@ -285,8 +287,10 @@ pub fn pick(query: &str, kind: Kind, search: &Value) -> Option<Pick> {
         .map(|c| Pick { uri: c.uri.clone(), label: c.label.clone() })
 }
 
+#[allow(dead_code)] // используется в задаче 4 (поиск)
 static TOKEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 
+#[allow(dead_code)] // используется в задаче 4 (поиск)
 async fn token(conf: &SpotifyConf) -> Result<String, String> {
     if let Some((t, exp)) = TOKEN.lock().unwrap().as_ref() {
         if Instant::now() < *exp {
@@ -311,6 +315,7 @@ async fn token(conf: &SpotifyConf) -> Result<String, String> {
     Ok(t)
 }
 
+#[allow(dead_code)] // используется в задаче 4 (поиск)
 fn search_types(kind: Kind) -> &'static str {
     match kind {
         Kind::Any => "track,artist,album,playlist",
@@ -322,6 +327,7 @@ fn search_types(kind: Kind) -> &'static str {
     }
 }
 
+#[allow(dead_code)] // используется в задаче 4 (поиск)
 /// Поиск в Spotify Web API (client credentials) и сверка. `Ok(None)` — ничего подходящего.
 pub async fn search(conf: &SpotifyConf, query: &str, kind: Kind) -> Result<Option<Pick>, String> {
     if !conf.can_search() {
@@ -346,21 +352,53 @@ pub async fn search(conf: &SpotifyConf, query: &str, kind: Kind) -> Result<Optio
     Ok(pick(query, kind, &v))
 }
 
-/// Текущее состояние Soloist; не запущен, завис или мусор — `None`.
-pub async fn now() -> Option<SpotState> {
+/// Запускает `soloist ctl -w 127.0.0.1:9090 <args>` и возвращает stdout.
+/// По таймауту процесс убивается и дожидается (`kill` = SIGKILL + wait), зомби не остаётся.
+async fn soloist(args: &[&str], secs: u64) -> Option<(bool, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new(SOLOIST_BIN);
-    cmd.args(["ctl", "-w", "127.0.0.1:9090", "now", "--json"])
+    cmd.args(["ctl", "-w", "127.0.0.1:9090"])
+        .args(args)
         .env("LD_LIBRARY_PATH", SOLOIST_LIB)
         .current_dir("/")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    // при таймауте future отбрасывается, kill_on_drop убивает процесс
-    let out = tokio::time::timeout(Duration::from_secs(4), cmd.output()).await.ok()?.ok()?;
-    if !out.status.success() {
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let done = tokio::time::timeout(Duration::from_secs(secs), async {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await.ok()?;
+        let st = child.wait().await.ok()?;
+        Some((st.success(), buf))
+    })
+    .await;
+    match done {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = child.kill().await;
+            None
+        }
+    }
+}
+
+/// Текущее состояние Soloist; не запущен, завис или мусор — `None`.
+pub async fn now() -> Option<SpotState> {
+    let (ok, out) = soloist(&["now", "--json"], 4).await?;
+    if !ok {
         return None;
     }
-    parse_now(&String::from_utf8_lossy(&out.stdout))
+    parse_now(&String::from_utf8_lossy(&out))
+}
+
+/// Перемотка: `soloist ctl seek <ms>` (control.sh этой команды не знает).
+pub async fn seek(ms: u64) -> Result<(), String> {
+    match soloist(&["seek", &ms.to_string()], 8).await {
+        Some((true, _)) => Ok(()),
+        Some((false, _)) => Err("перемотка не удалась".into()),
+        None => Err("Soloist не ответил".into()),
+    }
 }
 
 /// `sh control.sh <args…>`: 15 с для `search`, 8 с для остальных.
