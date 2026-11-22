@@ -567,12 +567,13 @@ impl Engine {
     }
 
     /// Начать разговор (по слову, по кнопке в настройках).
-    pub fn trigger(self: &Arc<Self>, source: &str, prob: f32) {
-        if source == "слово" && self.recording_word.load(Ordering::Acquire) { return; }
+    /// `true` — разговор начался (и сам вызовет `talk_ended`); `false` — триггер отброшен.
+    pub fn trigger(self: &Arc<Self>, source: &str, prob: f32) -> bool {
+        if source == "слово" && self.recording_word.load(Ordering::Acquire) { return false; }
         let clip = {
             let mut st = self.st.lock().unwrap();
             if st.busy || st.last_wake.is_some_and(|t| t.elapsed() < Duration::from_millis(1500)) {
-                return;
+                return false;
             }
             st.busy = true;
             st.echo = EchoWindow::default();
@@ -648,12 +649,15 @@ impl Engine {
                 e.leds.set(Mode::Off);
                 if queued {
                     // следующий разговор продолжает ту же паузу Spotify
-                    e.trigger("слово", 1.0);
+                    if !e.trigger("слово", 1.0) {
+                        e.music.talk_ended(&e.rt);
+                    }
                 } else {
                     e.music.talk_ended(&e.rt);
                 }
             })
             .expect("поток разговора");
+        true
     }
 
     fn instructions(&self, s: &Settings, p: &Profile) -> String {
@@ -796,6 +800,8 @@ impl Engine {
     }
 
     fn earcon(&self, ok: bool) {
+        // все вызывающие — потоки без рантайма или spawn_blocking, где rt.block_on уже в ходу
+        self.wait_music_quiet();
         if self.player.start(RATE).is_ok() {
             let _ = self.player.write(&fastcmd::earcon(ok));
             self.player.finish(Duration::from_secs(2));

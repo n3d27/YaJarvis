@@ -103,6 +103,11 @@ impl TalkPause {
     }
 }
 
+/// Состояние для решения о возобновлении: живой опрос, а при сбое — последнее известное.
+fn end_state(live: Option<SpotState>, cached: SpotState) -> SpotState {
+    live.filter(|s| !s.status.is_empty()).unwrap_or(cached)
+}
+
 pub struct Music {
     state: Mutex<Remote>,
     talk: Mutex<TalkPause>,
@@ -372,8 +377,11 @@ impl Music {
             if !m.talk.lock().unwrap().is_ours() {
                 return;
             }
-            let live = tokio::time::timeout(Duration::from_millis(1500), spotify::now()).await.ok().flatten();
-            let sp = live.unwrap_or_default();
+            let mut live = tokio::time::timeout(Duration::from_millis(1500), spotify::now()).await.ok().flatten();
+            if live.is_none() {
+                live = tokio::time::timeout(Duration::from_millis(1500), spotify::now()).await.ok().flatten();
+            }
+            let sp = end_state(live, m.spotify_current());
             // YouTube или Алиса заиграли во время разговора — Spotify не возвращаем
             let other = m.state().playing || m.alice.lock().unwrap().playing();
             let resume = m.talk.lock().unwrap().on_end(&sp) && !other;
@@ -1345,6 +1353,14 @@ mod tests {
         t.on_wake(&spt("playing", "u1"));
         assert!(!t.on_wake(&spt("paused", "u1")));
         assert!(t.on_end(&spt("paused", "u1")));
+    }
+    #[test] fn failed_now_falls_back_to_cached_pause() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        let sp = end_state(None, spt("paused", "u1"));
+        assert!(t.on_end(&sp));
+        let sp = end_state(Some(SpotState::default()), spt("paused", "u1"));
+        assert_eq!(sp.uri, "u1");
     }
     #[test] fn end_always_forgets() {
         let mut t = TalkPause::default();
