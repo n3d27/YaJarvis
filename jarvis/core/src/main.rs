@@ -9,6 +9,7 @@ mod audio;
 mod chatgpt;
 mod buttons;
 mod speakervol;
+mod spotify;
 mod cmdspot;
 mod counter;
 mod memory;
