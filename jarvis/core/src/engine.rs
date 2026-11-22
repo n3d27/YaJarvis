@@ -517,6 +517,16 @@ impl Engine {
         self.music.playing()
     }
 
+    /// Лайк, дизлайк, следующий и предыдущий трек, пока играет Spotify: отдаём музыкальному модулю.
+    fn spotify_phrase(&self, phrase: &str) -> bool {
+        if self.music.source() != crate::music::Source::Spotify { return false; }
+        let Some((op, args, _)) = crate::music::command(phrase) else { return false };
+        if !matches!(op, "like" | "unlike" | "next" | "prev") { return false; }
+        log::info!("Джарвис: «{phrase}» — {op} в Spotify (встроенный распознаватель)");
+        let _ = self.rt.block_on(self.music.transport(&self.host, op, args));
+        true
+    }
+
     /// Встроенный распознаватель услышал команду, пока Джарвис занят.
     fn on_command(&self, phrase: &str) {
         let w = phrase.to_lowercase();
@@ -528,6 +538,7 @@ impl Engine {
                 let _ = self.rt.block_on(self.music.transport(&self.host, op, serde_json::Value::Null));
                 return;
             }
+            if self.spotify_phrase(phrase) { return; }
             if has("громче") || has("тише") {
                 let level = crate::speakervol::speaker_volume().unwrap_or(5) + if has("тише") { -1 } else { 1 };
                 let _ = crate::speakervol::set_alice_volume(level.clamp(0,10));
@@ -555,6 +566,7 @@ impl Engine {
                 Ok(())
             });
             log::info!("Джарвис: «{phrase}» — громкость {v}% (встроенный распознаватель)");
+        } else if self.spotify_phrase(phrase) {
         } else {
             log::info!("Джарвис: распознаватель услышал «{phrase}» — не моя команда");
         }
@@ -1059,9 +1071,17 @@ impl Engine {
         // таймеры, будильники, напоминания, музыка — умеет только штатная Алиса; команды умного дома
         // отдаём ей, если так выбрано в настройках
         let schedule = fastcmd::alice_schedule(&cmd);
-        let mut to_alice = fastcmd::alice_skill_for(&cmd, self.store.with(|s| s.use_home("yandexmusic")));
+        let yandex_music = self.store.with(|s| s.use_home("yandexmusic"));
+        let mut to_alice = fastcmd::alice_skill_for(&cmd, yandex_music);
         if to_alice.is_none() && self.store.with(|s| s.use_home("alice")) {
             to_alice = rt.block_on(self.tools.home_command(&cmd));
+        }
+        // последний рубеж перед alice::text: музыка и видео не уходят Алисе, их ведёт модель через play_music
+        if let Some(a) = &to_alice
+            && !(fastcmd::allow_to_alice(a, yandex_music) && fastcmd::allow_to_alice(&cmd, yandex_music))
+        {
+            log::info!("Джарвис: «{a}» не отдаю Алисе (музыка/видео при выключенной Яндекс Музыке) — разберётся сам");
+            to_alice = None;
         }
         if let Some(a) = to_alice {
             quiet();

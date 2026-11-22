@@ -168,11 +168,24 @@ pub fn alice_skill_for(text: &str, yandex_music: bool) -> Option<String> {
     if youtube_request(text) || clarification(text).is_some() {
         return None;
     }
-    alice_skill(text).filter(|b| yandex_music || !(alice_music_request(b) || generic_play(b)))
+    alice_skill(text).filter(|b| allow_to_alice(b, yandex_music))
+}
+
+/// Единственный фильтр перед alice::text: музыку, подкасты и видео («включи <что угодно>») Алисе не отдаём,
+/// пока Яндекс Музыка выключена. Иначе их играет не Джарвис (Spotify, потом YouTube), а штатная Алиса.
+pub fn allow_to_alice(cmd: &str, yandex_music: bool) -> bool {
+    if yandex_music {
+        return true;
+    }
+    if youtube_request(cmd) {
+        return false;
+    }
+    let bare = strip_lead(&norm_text(cmd));
+    !(alice_music_request(&bare) || generic_play(&bare))
 }
 
 /// «включи <что угодно>» без слов умного дома, таймеров и громкости: это просьба к Джарвису, не к Алисе.
-fn generic_play(bare: &str) -> bool {
+pub fn generic_play(bare: &str) -> bool {
     MUSIC_PLAY.is_match(bare) && !NOT_MUSIC.is_match(bare) && !HOME_WORDS.is_match(bare) && classify_schedule(bare) == AliceSchedule::None
 }
 
@@ -380,5 +393,16 @@ mod tests {
         assert!(alice_skill_for("включи будильник на 7", false).is_some());
         assert!(alice_skill_for("включи будильник на 7", true).is_some());
         assert!(alice_skill_for("включи таймер на 5 минут", false).is_some());
+    }
+
+    #[test]
+    fn allow_to_alice_blocks_music_keeps_home() {
+        for t in ["включи свет", "включи свет на кухне", "выключи свет", "включи телевизор", "сделай громче", "таймер на 5 минут", "поставь таймер на 5 минут", "будильник на 7", "включи будильник на 7"] {
+            assert!(allow_to_alice(t, false), "{t}");
+        }
+        for t in ["включи кино", "включи обзор айфона 17", "включи p nk розовое вино", "включи pink розовое вино", "включи подкаст про космос", "включи музыку", "Джарвис, включи кино"] {
+            assert!(!allow_to_alice(t, false), "{t}");
+            assert!(allow_to_alice(t, true), "{t}");
+        }
     }
 }

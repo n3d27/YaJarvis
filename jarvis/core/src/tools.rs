@@ -312,7 +312,7 @@ impl Tools {
             if let Some(question) = fastcmd::clarification(&cmd) {
                 return question.into();
             }
-            if !self.use_ch("yandexmusic") && fastcmd::alice_music_request(&fastcmd::strip_lead(&fastcmd::norm_text(&cmd))) {
+            if !self.use_ch("yandexmusic") && { let b = fastcmd::strip_lead(&fastcmd::norm_text(&cmd)); fastcmd::alice_music_request(&b) || fastcmd::generic_play(&b) } {
                 return "Для музыки вызови play_music.".into();
             }
             if fastcmd::youtube_request(&cmd) {
