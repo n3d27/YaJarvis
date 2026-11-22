@@ -70,8 +70,47 @@ pub struct SpotTrack {
     fails: u8,
 }
 
+/// Пауза Spotify на время разговора: помним, что именно мы остановили.
+#[derive(Default)]
+pub struct TalkPause {
+    /// uri трека в момент нашей паузы.
+    ours: Option<String>,
+}
+
+impl TalkPause {
+    /// Джарвис проснулся. `true` — Spotify играет и его надо поставить на паузу.
+    pub fn on_wake(&mut self, sp: &SpotState) -> bool {
+        if self.ours.is_none() && sp.status == "playing" {
+            self.ours = Some(sp.uri.clone());
+            return true;
+        }
+        false
+    }
+
+    /// Разговор закончился. `true` — пауза наша и ничего не сменилось: надо слать play. Всегда забывает паузу.
+    pub fn on_end(&mut self, sp: &SpotState) -> bool {
+        let ours = self.ours.take();
+        ours.is_some_and(|u| u == sp.uri) && sp.status == "paused"
+    }
+
+    /// Пауза не состоялась или человек сам распорядился музыкой: возобновлять нечего.
+    pub fn forget(&mut self) {
+        self.ours = None;
+    }
+
+    fn is_ours(&self) -> bool {
+        self.ours.is_some()
+    }
+}
+
 pub struct Music {
     state: Mutex<Remote>,
+    talk: Mutex<TalkPause>,
+    /// Сериализует паузу и возобновление, чтобы они не обгоняли друг друга.
+    talk_gate: tokio::sync::Mutex<()>,
+    /// `true` — Spotify молчит (или паузы не требовалось).
+    quiet: tokio::sync::watch::Sender<bool>,
+    talk_at: Mutex<Option<Instant>>,
     pub alice: Mutex<AliceMusic>,
     pub spotify: Mutex<SpotTrack>,
     button: Mutex<Button>,
@@ -88,6 +127,10 @@ impl Default for Music {
     fn default() -> Self {
         Self {
             state: Mutex::default(),
+            talk: Mutex::default(),
+            talk_gate: tokio::sync::Mutex::new(()),
+            quiet: tokio::sync::watch::channel(true).0,
+            talk_at: Mutex::new(None),
             alice: Mutex::default(),
             spotify: Mutex::default(),
             button: Mutex::default(),
@@ -276,6 +319,76 @@ impl Music {
         }
     }
 
+    /// Джарвис проснулся: Spotify на паузу, не задерживая слушание. Неблокирующий.
+    pub fn talk_started(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        *self.talk_at.lock().unwrap() = Some(Instant::now());
+        self.quiet.send_replace(false);
+        let m = self.clone();
+        rt.spawn(async move {
+            let _gate = m.talk_gate.lock().await;
+            m.pause_for_talk().await;
+            m.quiet.send_replace(true);
+        });
+    }
+
+    async fn pause_for_talk(&self) {
+        let live = tokio::time::timeout(Duration::from_millis(1200), spotify::now()).await.ok().flatten();
+        let sp = live.unwrap_or_else(|| self.spotify_current());
+        if !self.talk.lock().unwrap().on_wake(&sp) {
+            return;
+        }
+        if spotify::ctl(&["pause"]).await.is_err() {
+            self.talk.lock().unwrap().forget();
+            log::info!("spotify: пауза на время разговора не удалась");
+            return;
+        }
+        self.mark_spotify("paused");
+        log::info!("spotify: пауза на время разговора");
+        // дождаться, пока Soloist подтвердит тишину
+        for _ in 0..6 {
+            match tokio::time::timeout(Duration::from_millis(500), spotify::now()).await {
+                Ok(Some(s)) if s.status != "playing" => break,
+                Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(100)).await,
+                _ => break,
+            }
+        }
+    }
+
+    /// Ждёт тишины Spotify, но не дольше `max` от начала разговора. Таймаут — идём дальше.
+    pub async fn wait_quiet(&self, max: Duration) {
+        let left = match *self.talk_at.lock().unwrap() {
+            Some(at) => max.saturating_sub(at.elapsed()),
+            None => return,
+        };
+        let mut rx = self.quiet.subscribe();
+        let _ = tokio::time::timeout(left, rx.wait_for(|q| *q)).await;
+    }
+
+    /// Разговор окончен: вернуть Spotify, только если пауза наша. Неблокирующий.
+    pub fn talk_ended(self: &Arc<Self>, rt: &tokio::runtime::Handle) {
+        let m = self.clone();
+        rt.spawn(async move {
+            let _gate = m.talk_gate.lock().await;
+            if !m.talk.lock().unwrap().is_ours() {
+                return;
+            }
+            let live = tokio::time::timeout(Duration::from_millis(1500), spotify::now()).await.ok().flatten();
+            let sp = live.unwrap_or_default();
+            // YouTube или Алиса заиграли во время разговора — Spotify не возвращаем
+            let other = m.state().playing || m.alice.lock().unwrap().playing();
+            let resume = m.talk.lock().unwrap().on_end(&sp) && !other;
+            if resume && spotify::ctl(&["play"]).await.is_ok() {
+                m.mark_spotify("playing");
+                log::info!("spotify: возобновлён после разговора");
+            }
+        });
+    }
+
+    /// Человек сам решил судьбу музыки (пауза, стоп): возобновлять после разговора нечего.
+    fn forget_talk(&self) {
+        self.talk.lock().unwrap().forget();
+    }
+
     /// Spotify заиграл (по опросу): YouTube и Алиса молчат.
     pub async fn on_spotify_started(&self, host: &Host) {
         if self.state().playing {
@@ -311,6 +424,7 @@ impl Music {
     async fn spotify_control(&self, op: &str, args: &Value) -> Result<(), String> {
         match op {
             "pause" | "stop" => {
+                self.forget_talk();
                 spotify::ctl(&["pause"]).await?;
                 self.mark_spotify("paused");
             }
@@ -370,6 +484,7 @@ impl Music {
     }
 
     pub async fn stop_all(&self, host: &Host) {
+        self.forget_talk();
         let stop_alice = self.alice.lock().unwrap().active();
         let _ = tokio::join!(self.call(host, "stop", Value::Null), async {
             if stop_alice { let _ = self.alice_control("stop", &Value::Null).await; }
@@ -1202,5 +1317,63 @@ mod tests {
         assert_eq!(lower_first("Включил с YouTube: X."), "включил с YouTube: X.");
         assert_eq!(lower_first("Éa"), "éa");
         assert_eq!(lower_first(""), "");
+    }
+
+    fn spt(status: &str, uri: &str) -> SpotState { SpotState { status: status.into(), uri: uri.into(), ..Default::default() } }
+    #[test] fn resumes_only_our_pause() {
+        let mut t = TalkPause::default();
+        assert!(t.on_wake(&spt("playing", "u1")));
+        assert!(t.on_end(&spt("paused", "u1")));
+    }
+    #[test] fn no_resume_if_something_else_started() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        assert!(!t.on_end(&spt("playing", "u2")));
+    }
+    #[test] fn no_resume_if_other_track_paused() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        assert!(!t.on_end(&spt("paused", "u2")));
+    }
+    #[test] fn no_pause_when_not_playing() {
+        let mut t = TalkPause::default();
+        assert!(!t.on_wake(&spt("paused", "")));
+        assert!(!t.on_end(&spt("paused", "")));
+    }
+    #[test] fn second_wake_keeps_first_pause() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        assert!(!t.on_wake(&spt("paused", "u1")));
+        assert!(t.on_end(&spt("paused", "u1")));
+    }
+    #[test] fn end_always_forgets() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        assert!(!t.on_end(&spt("playing", "u1")));
+        assert!(!t.on_end(&spt("paused", "u1")));
+    }
+    #[test] fn forget_cancels_resume() {
+        let mut t = TalkPause::default();
+        t.on_wake(&spt("playing", "u1"));
+        t.forget();
+        assert!(!t.on_end(&spt("paused", "u1")));
+    }
+    #[tokio::test]
+    async fn wait_quiet_is_bounded_and_noop_without_talk() {
+        let m = Arc::new(Music::default());
+        let t = Instant::now();
+        m.wait_quiet(Duration::from_millis(1500)).await;
+        assert!(t.elapsed() < Duration::from_millis(100));
+        *m.talk_at.lock().unwrap() = Some(Instant::now());
+        m.quiet.send_replace(false);
+        let t = Instant::now();
+        m.wait_quiet(Duration::from_millis(200)).await;
+        let e = t.elapsed();
+        assert!(e >= Duration::from_millis(150) && e < Duration::from_millis(600));
+        let m2 = m.clone();
+        tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(50)).await; m2.quiet.send_replace(true); });
+        let t = Instant::now();
+        m.wait_quiet(Duration::from_millis(5000)).await;
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
 }

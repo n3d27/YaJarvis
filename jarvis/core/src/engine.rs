@@ -595,6 +595,7 @@ impl Engine {
         } else {
             log::info!("Джарвис: активация ({source})");
         }
+        self.music.talk_started(&self.rt);
         let e = self.clone();
         std::thread::Builder::new()
             .name("converse".into())
@@ -620,6 +621,7 @@ impl Engine {
                             st.holding = false;
                             st.echo = EchoWindow::default();
                             st.wake_echo = None;
+                            self.engine.music.talk_ended(&self.engine.rt);
                             self.engine.reset_wake.store(true, Ordering::Relaxed);
                             self.engine.leds.set(Mode::Off);
                         }
@@ -645,7 +647,10 @@ impl Engine {
                 e.reset_wake.store(true, Ordering::Relaxed);
                 e.leds.set(Mode::Off);
                 if queued {
+                    // следующий разговор продолжает ту же паузу Spotify
                     e.trigger("слово", 1.0);
+                } else {
+                    e.music.talk_ended(&e.rt);
                 }
             })
             .expect("поток разговора");
@@ -778,7 +783,13 @@ impl Engine {
         })
     }
 
+    /// Перед первым звуком ответа: подождать, пока Spotify замолчит (не дольше 1,5 с от активации).
+    fn wait_music_quiet(&self) {
+        self.rt.block_on(self.music.wait_quiet(Duration::from_millis(1500)));
+    }
+
     fn start_voice(&self, sess: &dyn Session) -> Result<(), String> {
+        self.wait_music_quiet();
         self.player.start(sess.rate()).map_err(|e| e.to_string())?;
         self.player.set_boost(sess.out_boost());
         Ok(())
@@ -849,6 +860,7 @@ impl Engine {
             };
             *sess = Some(x.clone());
             if let Some(sample) = reply {
+                self.wait_music_quiet();
                 self.play_wake_reply(&sample, &p.engine, opening_at);
             }
             if self.st.lock().unwrap().aborted {
