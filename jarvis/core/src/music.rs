@@ -317,6 +317,19 @@ impl Music {
         }
     }
 
+    pub async fn play_intent(&self, host: &Host, text: &str) -> Option<String> {
+        let intent = parse_play_intent(text)?;
+        if host.provider("youtube").is_err() {
+            return None;
+        }
+        Some(match intent {
+            PlayIntent::Liked { shuffle } => self.play_liked(host, shuffle, false).await,
+            PlayIntent::Playlist { query, shuffle } => {
+                self.play_playlist(host, &query, shuffle, false).await
+            }
+        })
+    }
+
     pub async fn control(&self, host: &Host, text: &str) -> Option<String> {
         let command = command(text);
         if self.use_alice() && let Some((op, args, answer)) = &command {
@@ -335,16 +348,6 @@ impl Music {
                 Err(e) => return Some(format!("Не получилось: {e}")),
                 _ => {}
             }
-        }
-        if let Some(intent) = parse_play_intent(text)
-            && host.provider("youtube").is_ok()
-        {
-            return Some(match intent {
-                PlayIntent::Liked { shuffle } => self.play_liked(host, shuffle, false).await,
-                PlayIntent::Playlist { query, shuffle } => {
-                    self.play_playlist(host, &query, shuffle, false).await
-                }
-            });
         }
         if !self.state().active {
             return None;

@@ -41,7 +41,9 @@ fn trim_pre_connect_silence(pending: &mut Vec<i16>, quiet_amp: u16, keep: usize)
     while pending.len().saturating_sub(drop_n) >= keep + FRAME
         && pending[drop_n..drop_n + FRAME]
             .iter()
-            .all(|v| v.unsigned_abs() <= quiet_amp)
+            .filter(|v| v.unsigned_abs() > quiet_amp)
+            .count()
+            < 24
     {
         drop_n += FRAME;
     }
@@ -186,9 +188,7 @@ impl ChatGptSession {
         if ok {
             let queued_samples = {
                 let mut pending = self.pending.lock().unwrap();
-                if !self.dialog.heard_input_since(self.created) {
-                    trim_pre_connect_silence(&mut pending, threshold, 2560);
-                }
+                trim_pre_connect_silence(&mut pending, threshold, 2560);
                 pending.len()
             };
             self.connected.store(true, Ordering::Release);
@@ -197,8 +197,28 @@ impl ChatGptSession {
                 self.created.elapsed().as_secs_f64(),
                 queued_samples as f64 / 16000.0
             );
+            let warm = n.clone();
+            tokio::spawn(async move {
+                let _ = warm.request("voice.warm", Value::Null, Duration::from_secs(5)).await;
+            });
         }
         let _ = started.send(res);
+        if ok {
+            for _ in 0..24 {
+                if self.cancelled.load(Ordering::SeqCst) {
+                    break;
+                }
+                let pcm = take_mic_caught_up_with(&mut self.pending.lock().unwrap(), FEED_MAX, threshold);
+                if pcm.is_empty() {
+                    break;
+                }
+                let bytes: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                if n.notify("voice.feed", json!({"id": self.id, "pcm": B64.encode(bytes)})).await.is_err() {
+                    self.cancel();
+                    break;
+                }
+            }
+        }
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while ok && !self.cancelled.load(Ordering::SeqCst) {
@@ -402,7 +422,7 @@ pub async fn warm_loop(host: Arc<Host>, store: crate::settings::Store) {
         {
             let _ = n.request("voice.warm", Value::Null, Duration::from_secs(5)).await;
         }
-        tokio::time::sleep(Duration::from_secs(50)).await;
+        tokio::time::sleep(Duration::from_secs(25)).await;
     }
 }
 
@@ -551,8 +571,14 @@ mod tests {
         });
         let _ = sess;
 
-        // Тихая речь (> quiet_threshold) не вырезается при подключении, а ведущая тишина перед ней — обрезается.
+        // Тихая речь (> quiet_threshold) не вырезается при подключении, а ведущая тишина
+        // (включая редкие щелчки эха <24 сэмплов/кадр) перед ней — обрезается.
         let mut pending = vec![30i16; 16_000];
+        for frame in pending.chunks_mut(320) {
+            for sample in frame.iter_mut().take(6) {
+                *sample = 900;
+            }
+        }
         pending.extend(vec![110i16; 6_400]);
         super::trim_pre_connect_silence(&mut pending, super::quiet_threshold(0), 2560);
         assert_eq!(pending.len(), 6_400);

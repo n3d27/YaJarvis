@@ -40,6 +40,7 @@ re!(DURATION_WORD, r"^(?:(?:секунд|минут|час|день|дня|дн�
 
 pub const ALICE_TIME_QUESTION: &str = "Повтори команду целиком и укажи, когда или через сколько.";
 pub const YOUTUBE_QUESTION: &str = "Что включить на YouTube? Назови трек или исполнителя.";
+pub const PLAYLIST_QUESTION: &str = "Какой плейлист включить? Назови его название.";
 
 pub fn youtube_request(text: &str) -> bool {
     let bare = strip_lead(&norm_text(text));
@@ -59,6 +60,32 @@ pub fn clarification(text: &str) -> Option<&'static str> {
             "трек" | "песню" | "музыку" | "ролик" | "видео" | "клип" | "плейлист" | "альбом" | "подкаст"))
     {
         return Some(YOUTUBE_QUESTION);
+    }
+    if MUSIC_PLAY.is_match(bare) {
+        let rest: Vec<&str> = bare
+            .split_whitespace()
+            .skip(1)
+            .filter(|w| {
+                !matches!(
+                    *w,
+                    "мой"
+                        | "свой"
+                        | "сохраненный"
+                        | "личный"
+                        | "на"
+                        | "в"
+                        | "с"
+                        | "из"
+                        | "ютуб"
+                        | "ютубе"
+                        | "ютуба"
+                        | "youtube"
+                )
+            })
+            .collect();
+        if !rest.is_empty() && rest.iter().all(|w| matches!(*w, "плейлист" | "плейлисты")) {
+            return Some(PLAYLIST_QUESTION);
+        }
     }
     let mut words = bare.split_whitespace();
     let verb = words.next()?;
@@ -337,6 +364,12 @@ mod tests {
         }
         assert!(home_command_local("включи на кухне свет").is_some());
         assert!(alice_skill_for("включи музыку", true).is_some());
+        for text in ["Включи плейлист", "Джарвис, поставь мой плейлист"] {
+            assert_eq!(clarification(text), Some(PLAYLIST_QUESTION), "{text}");
+            assert!(alice_skill_for(text, true).is_none(), "{text}");
+            assert!(home_command_local(text).is_none(), "{text}");
+        }
+        assert!(clarification("Включи плейлист Макробер музыка").is_none());
     }
 
     #[test]

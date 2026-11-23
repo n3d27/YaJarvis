@@ -208,7 +208,7 @@ impl Tools {
         }
         if self.music.is_some() && self.host.provider("youtube").is_ok() {
             let who = if self.use_ch("yandexmusic") {
-                "Обычную музыку по названию включает Алиса. Если явно просят YouTube, используй этот инструмент."
+                "Обычную музыку по названию включает Алиса. Но если просят YouTube, свои лайки/понравившиеся или плейлист (и не упомянули Яндекс/Алису), всегда используй play_music, а не alice_command."
             } else {
                 "Яндекс Музыка выключена в настройках: любую музыку, песню или радио включай только этим инструментом, сразу, запрос придумай сам, если не назвали."
             };
@@ -228,7 +228,16 @@ impl Tools {
                     "required": ["command"]}}));
         }
         if self.use_ch("alice") {
-            defs.push(def("alice_command"));
+            let mut alice_tool = def("alice_command");
+            if self.music.is_some()
+                && self.host.provider("youtube").is_ok()
+                && let Some(desc) = alice_tool.get("description").and_then(Value::as_str)
+            {
+                alice_tool["description"] = Value::String(format!(
+                    "{desc} Лайки и плейлисты YouTube не передавай сюда — для них используй play_music."
+                ));
+            }
+            defs.push(alice_tool);
         }
         if self.memory.as_ref().is_some_and(|m| m.enabled()) {
             defs.push(def("recall_conversation"));

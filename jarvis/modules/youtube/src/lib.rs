@@ -129,7 +129,7 @@ impl State {
 pub struct Youtube {
     host: Arc<Host>,
     account: Arc<Account>,
-    remote: Remote,
+    remote: Arc<Remote>,
     state: Mutex<State>,
     ready: OnceCell<()>,
     request: AsyncMutex<()>,
@@ -144,7 +144,7 @@ impl Youtube {
     pub fn new(host: Host) -> Self {
         let host = Arc::new(host);
         Self {
-            remote: Remote::new(host.clone()),
+            remote: Arc::new(Remote::new(host.clone())),
             account: Arc::new(Account::new(host.clone())),
             host,
             state: Mutex::default(),
@@ -1117,18 +1117,20 @@ impl Youtube {
                 self.account
                     .set_cookies(&self.remote, args["cookies"].as_str().unwrap_or_default())
                     .await?;
+                self.account.clear_profile_cache().await;
                 self.library_cache.lock().await.clear();
                 Ok(Value::Null)
             }
             "cookies_clear" => {
                 self.account.clear_cookies()?;
+                self.account.clear_profile_cache().await;
                 self.library_cache.lock().await.clear();
                 Ok(Value::Null)
             }
             "account" => {
-                Ok(json!({"set":self.account.has_cookies(),"account":self.account.state().await?}))
+                Ok(json!({"set":self.account.has_cookies(),"account":self.account.state(&self.remote).await?}))
             }
-            "account_begin" => self.account.begin().await,
+            "account_begin" => self.account.begin(&self.remote).await,
             "account_logout" => {
                 self.account.logout().await?;
                 self.library_cache.lock().await.clear();
@@ -1475,11 +1477,12 @@ pub(crate) fn match_saved_playlist<'a>(
             continue;
         }
         let matched = title.contains(&q)
-            || (title.len() >= 3 && q.contains(&title))
             || (!q_words.is_empty()
-                && q_words
-                    .iter()
-                    .all(|w| title.split_whitespace().any(|tw| tw == *w || tw.starts_with(w))));
+                && q_words.iter().all(|w| {
+                    title
+                        .split_whitespace()
+                        .any(|tw| tw == *w || (w.chars().count() >= 3 && tw.starts_with(w)))
+                }));
         if matched {
             let diff = title.len().abs_diff(q.len());
             if best.is_none_or(|(best_diff, _)| diff < best_diff) {
@@ -1717,6 +1720,11 @@ mod tests {
                 title: "Synthwave 2026".into(),
                 ..Default::default()
             },
+            Playlist {
+                id: "PL4".into(),
+                title: "Музыка".into(),
+                ..Default::default()
+            },
         ];
         assert_eq!(
             match_saved_playlist(&pls, "lo-fi beats").map(|p| p.id.as_str()),
@@ -1734,6 +1742,11 @@ mod tests {
             match_saved_playlist(&pls, "synth").map(|p| p.id.as_str()),
             Some("PL3")
         );
+        assert_eq!(
+            match_saved_playlist(&pls, "музыка").map(|p| p.id.as_str()),
+            Some("PL4")
+        );
+        assert!(match_saved_playlist(&pls, "макробер музыка").is_none());
         assert!(match_saved_playlist(&pls, "джаз").is_none());
 
         let mut tracks: Vec<Track> = (0..10)

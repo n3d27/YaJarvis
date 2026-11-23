@@ -27,9 +27,17 @@
   let signedIn = $derived(
     Boolean(youtube?.plugin && (youtube?.account?.signed_in || youtube?.set)),
   );
+  let accountLabel = $derived(
+    [
+      youtube?.account?.name && youtube.account.name !== "Аккаунт Google" ? youtube.account.name : "",
+      youtube?.account?.handle || youtube?.account?.email || "",
+    ]
+      .filter((v, i, arr) => v && arr.indexOf(v) === i)
+      .join(" · "),
+  );
   let signedKey = $derived(
     signedIn
-      ? `${Boolean(youtube?.account?.signed_in)}:${Boolean(youtube?.set)}:${youtube?.account?.name || ""}`
+      ? `${Boolean(youtube?.account?.signed_in)}:${Boolean(youtube?.set)}:${youtube?.account?.name || ""}:${youtube?.account?.handle || ""}:${youtube?.account?.email || ""}`
       : "",
   );
   let liked = $derived(library?.liked || []);
@@ -129,7 +137,7 @@
     <div class="card-head">
       <div>
         <h2 id="yt-library-title">Медиатека YouTube</h2>
-        <span class="meta">После входа в аккаунт · лайки и сохранённые плейлисты</span>
+        <span class="meta">{accountLabel ? `${accountLabel} · ` : ""}лайки и сохранённые плейлисты</span>
       </div>
       <div class={styles.headRight}>
         <div class="seg sm" role="tablist" aria-label="Разделы медиатеки YouTube">

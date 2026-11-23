@@ -38,7 +38,12 @@ pub struct CoreServices {
 
 fn yt_auth(s: &crate::settings::Settings) -> Value {
     let g = |k: &str| s.extra.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    json!({"refresh": g("youtube_refresh"), "name": g("youtube_name")})
+    json!({
+        "refresh": g("youtube_refresh"),
+        "name": g("youtube_name"),
+        "handle": g("youtube_handle"),
+        "email": g("youtube_email")
+    })
 }
 
 impl CoreServices {
@@ -132,7 +137,12 @@ impl CoreServices {
                         }
                         match service {
                             "youtube" => {
-                                for (k, from) in [("youtube_refresh", "refresh"), ("youtube_name", "name")] {
+                                for (k, from) in [
+                                    ("youtube_refresh", "refresh"),
+                                    ("youtube_name", "name"),
+                                    ("youtube_handle", "handle"),
+                                    ("youtube_email", "email"),
+                                ] {
                                     st.extra.insert(k.into(), after.get(from).cloned().unwrap_or(Value::from("")));
                                 }
                                 return Ok(());

@@ -56,6 +56,52 @@ pub struct Playlist {
     )]
     pub thumb: String,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccountProfile {
+    pub name: String,
+    pub handle: String,
+    pub email: String,
+}
+
+impl AccountProfile {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty() && self.handle.is_empty() && self.email.is_empty()
+    }
+
+    pub fn merge_missing(&mut self, other: AccountProfile) {
+        if self.name.is_empty() {
+            self.name = other.name;
+        }
+        if self.handle.is_empty() {
+            self.handle = other.handle;
+        }
+        if self.email.is_empty() {
+            self.email = other.email;
+        }
+        self.normalize();
+    }
+
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        self.handle = self.handle.trim().to_string();
+        self.email = self.email.trim().to_string();
+        if self.handle.contains('@') && !self.handle.starts_with('@') {
+            if self.email.is_empty() {
+                self.email = std::mem::take(&mut self.handle);
+            } else {
+                self.handle.clear();
+            }
+        }
+        if self.email.starts_with('@') {
+            if self.handle.is_empty() {
+                self.handle = std::mem::take(&mut self.email);
+            } else {
+                self.email.clear();
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Stream {
     pub url: Url,
@@ -125,14 +171,14 @@ impl Remote {
         Ok(tracks)
     }
 
-    pub async fn browse_request(
+    async fn post_client(
         &self,
+        path: &str,
         mut body: Value,
         mut headers: HeaderMap,
     ) -> Result<Value, String> {
         let client = self.host.client().await?;
-        let authed = !headers.is_empty();
-        let data = if has_bearer(&headers) {
+        if has_bearer(&headers) {
             headers.insert(
                 "X-YouTube-Client-Name",
                 reqwest::header::HeaderValue::from_static("7"),
@@ -151,15 +197,23 @@ impl Remote {
                     json!({"client": {"clientName": "TVHTML5", "clientVersion": TV_BROWSE_VERSION, "hl": "ru", "gl": "RU", "platform": "TV", "deviceMake": "Samsung", "deviceModel": "SmartTV"}}),
                 );
             }
-            post(&client, "browse", TV_AGENT, &body, headers).await
+            post(&client, path, TV_AGENT, &body, headers).await
         } else {
             strip_bearer(&mut headers);
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("context".into(), json!({"client": web()}));
             }
-            post(&client, "browse", WEB_AGENT, &body, headers).await
+            post(&client, path, WEB_AGENT, &body, headers).await
         }
-        .map_err(|e| {
+    }
+
+    pub async fn browse_request(
+        &self,
+        body: Value,
+        headers: HeaderMap,
+    ) -> Result<Value, String> {
+        let authed = !headers.is_empty();
+        let data = self.post_client("browse", body, headers).await.map_err(|e| {
             if authed && (e.contains("401") || e.contains("403")) {
                 "YouTube просит войти заново".into()
             } else {
@@ -170,6 +224,41 @@ impl Remote {
             return Err("YouTube просит войти заново".into());
         }
         Ok(data)
+    }
+
+    pub async fn account_profile(&self, headers: HeaderMap) -> Result<AccountProfile, String> {
+        if headers.is_empty() {
+            return Ok(AccountProfile::default());
+        }
+        let mut profile = AccountProfile::default();
+        for endpoint in ["account/account_menu", "account/accounts_list"] {
+            if let Ok(data) = self.post_client(endpoint, json!({}), headers.clone()).await {
+                profile.merge_missing(parse_account_profile(&data));
+            }
+            if !profile.name.is_empty() && (!profile.handle.is_empty() || !profile.email.is_empty())
+            {
+                break;
+            }
+        }
+        if has_bearer(&headers)
+            && (profile.name.is_empty() || profile.handle.is_empty())
+            && let Ok(data) = self
+                .data_api_get(
+                    "channels",
+                    &[("part", "snippet"), ("mine", "true")],
+                    &headers,
+                )
+                .await
+        {
+            let snippet = &data["items"][0]["snippet"];
+            profile.merge_missing(AccountProfile {
+                name: snippet["title"].as_str().unwrap_or("").to_string(),
+                handle: snippet["customUrl"].as_str().unwrap_or("").to_string(),
+                email: String::new(),
+            });
+        }
+        profile.normalize();
+        Ok(profile)
     }
 
     async fn data_api_get(
@@ -902,6 +991,86 @@ pub(crate) fn organic_limit(
         _ => {}
     }
 }
+fn text_label(v: &Value) -> String {
+    let s = label(v);
+    if !s.is_empty() {
+        return s;
+    }
+    label(&v["content"])
+}
+
+pub(crate) fn parse_account_profile(value: &Value) -> AccountProfile {
+    fn walk(
+        value: &Value,
+        depth: u8,
+        header: &mut AccountProfile,
+        selected_item: &mut AccountProfile,
+        fallback_item: &mut AccountProfile,
+    ) {
+        if depth > 16 {
+            return;
+        }
+        match value {
+            Value::Array(list) => {
+                for item in list {
+                    walk(item, depth + 1, header, selected_item, fallback_item);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(hdr) = map.get("activeAccountHeaderRenderer") {
+                    header.merge_missing(AccountProfile {
+                        name: text_label(&hdr["accountName"]),
+                        handle: text_label(&hdr["channelHandle"]),
+                        email: text_label(&hdr["email"]),
+                    });
+                }
+                if let Some(item) = map.get("accountItemRenderer") {
+                    let byline = text_label(&item["accountByline"]);
+                    let (handle, email) = if byline.starts_with('@') {
+                        (byline, String::new())
+                    } else if byline.contains('@') {
+                        (String::new(), byline)
+                    } else {
+                        (String::new(), String::new())
+                    };
+                    let mut candidate = AccountProfile {
+                        name: text_label(&item["accountName"]),
+                        handle,
+                        email,
+                    };
+                    candidate.normalize();
+                    if item["isSelected"] == true {
+                        selected_item.merge_missing(candidate);
+                    } else {
+                        fallback_item.merge_missing(candidate);
+                    }
+                }
+                for child in map.values() {
+                    walk(child, depth + 1, header, selected_item, fallback_item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut header = AccountProfile::default();
+    let mut selected_item = AccountProfile::default();
+    let mut fallback_item = AccountProfile::default();
+    walk(
+        value,
+        0,
+        &mut header,
+        &mut selected_item,
+        &mut fallback_item,
+    );
+    header.merge_missing(selected_item);
+    if header.name.is_empty() {
+        header.merge_missing(fallback_item);
+    }
+    header.normalize();
+    header
+}
+
 pub(crate) fn parse_playlists(value: &Value) -> Vec<Playlist> {
     fn walk(
         value: &Value,
@@ -1479,5 +1648,65 @@ mod tests {
         assert_eq!(tracks[0].title, "Track One");
         assert_eq!(tracks[0].author, "Artist One");
         assert_eq!(continuation_token(shelf).as_deref(), Some("NEXT_PAGE_TOK"));
+    }
+
+    #[test]
+    fn parses_account_profile_from_menu_and_accounts_list() {
+        let menu = json!({
+            "actions": [{
+                "openPopupAction": {
+                    "popup": {
+                        "multiPageMenuRenderer": {
+                            "header": {
+                                "activeAccountHeaderRenderer": {
+                                    "accountName": {"simpleText": "NewFPV"},
+                                    "channelHandle": {"simpleText": "@newfpv"},
+                                    "email": {"simpleText": "user@example.com"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        assert_eq!(
+            parse_account_profile(&menu),
+            AccountProfile {
+                name: "NewFPV".into(),
+                handle: "@newfpv".into(),
+                email: "user@example.com".into(),
+            }
+        );
+
+        let accounts_list = json!({
+            "contents": [{
+                "accountSectionListRenderer": {
+                    "contents": [
+                        {
+                            "accountItemRenderer": {
+                                "isSelected": false,
+                                "accountName": {"simpleText": "Другой канал"},
+                                "accountByline": {"simpleText": "@other"}
+                            }
+                        },
+                        {
+                            "accountItemRenderer": {
+                                "isSelected": true,
+                                "accountName": {"runs": [{"text": "Основной канал"}]},
+                                "accountByline": {"simpleText": "main@example.com"}
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+        assert_eq!(
+            parse_account_profile(&accounts_list),
+            AccountProfile {
+                name: "Основной канал".into(),
+                handle: String::new(),
+                email: "main@example.com".into(),
+            }
+        );
     }
 }

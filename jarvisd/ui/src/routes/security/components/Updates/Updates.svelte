@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { api, toast, upload, waitRestart } from "#helpers/core.js";
+  import { api, icon, toast, upload, waitRestart } from "#helpers/core.js";
   import { renderMarkdown } from "#helpers/markdown.js";
   import styles from "./Updates.module.css";
 
@@ -9,12 +9,32 @@
   let update = $state.raw(null);
   let loadError = $state("");
   let pending = $state("");
+
   let automatic = $derived(!!(update?.check || update?.auto));
+  let releasesUrl = $derived(
+    update?.repo ? `https://github.com/${update.repo}/releases` : "https://github.com/newfpv/YaJarvis/releases"
+  );
+  let releaseUrl = $derived(
+    update?.repo && update?.latest ? `https://github.com/${update.repo}/releases/tag/v${update.latest}` : releasesUrl
+  );
+  let cleanNotes = $derived(stripLeadingTitle(update?.notes, update?.latest));
 
   onMount(() => {
     void load();
     return () => controller.abort();
   });
+
+  function stripLeadingTitle(raw, latest) {
+    const text = String(raw ?? "").trim();
+    if (!text) return "";
+    const lines = text.split(/\r?\n/);
+    const first = lines[0]?.trim() || "";
+    const ver = String(latest ?? "").trim().replace(/^v/i, "");
+    if (/^#{1,3}\s+/.test(first) && ver && first.toLowerCase().includes(ver.toLowerCase())) {
+      return lines.slice(1).join("\n").trim();
+    }
+    return text;
+  }
 
   async function load() {
     try {
@@ -87,63 +107,143 @@
   {#if loadError}
     <p class="err" role="alert">{loadError}</p>
   {:else if update}
-    <div class={["row", styles.actions]}>
-      <span>Версия <b>{update.version}</b></span>
-      <a class="btn sm ghost" href="https://github.com/newfpv/YaJarvis/releases" target="_blank" rel="noopener noreferrer">GitHub Releases</a>
-      {#if update.busy}
-        <span class="note"><span class="spin"></span>{update.busy}…</span>
-      {:else if update.available}
-        <span class="st ok">вышла {update.latest}</span>
-        <button class="btn sm primary" type="button" disabled={!!pending} onclick={install}>
-          {pending === "install" ? "Скачиваю…" : "Обновить"}
-        </button>
-      {:else if update.latest}
-        <span class="st ok">последняя</span>
-      {/if}
-      <span class="spacer"></span>
-      {#if update.repo}
-        <button class="btn sm" type="button" disabled={!!pending} onclick={checkNow}>Проверить</button>
-      {/if}
-      <label class={["btn sm ghost", styles.file]} data-tip={`Поставить файл ${update.asset} с компьютера`}>
-        Файлом…
-        <input type="file" disabled={!!pending} onchange={installFile}>
-      </label>
+    <div class={styles.statusCard}>
+      <div class={styles.versionInfo}>
+        <span class={styles.eyebrow}>Текущая версия</span>
+        <div class={styles.versionRow}>
+          <strong class={styles.version}>{update.version}</strong>
+          {#if update.busy}
+            <span class={[styles.pill, styles.pillBusy]}>
+              <span class="spin"></span>
+              {update.busy}…
+            </span>
+          {:else if update.available}
+            <span class={[styles.pill, styles.pillAccent]}>Доступна {update.latest}</span>
+          {:else if update.latest}
+            <span class={[styles.pill, styles.pillOk]}>Актуальная</span>
+          {/if}
+        </div>
+        {#if update.checked}
+          <small class={styles.checked}>Проверено {update.checked}</small>
+        {/if}
+      </div>
+
+      <div class={styles.toolbar}>
+        {#if update.repo}
+          <button class="btn sm" type="button" disabled={!!pending} onclick={checkNow}>
+            {@html icon("refresh")}
+            {pending === "check" ? "Проверяю…" : "Проверить"}
+          </button>
+        {/if}
+        <label class={["btn sm ghost", styles.file]} data-tip={`Поставить файл ${update.asset} с компьютера`}>
+          {@html icon("upload")}
+          Файлом…
+          <input type="file" disabled={!!pending} onchange={installFile}>
+        </label>
+        <a
+          class="btn sm ghost"
+          href={releasesUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-tip="Все релизы на GitHub"
+        >
+          GitHub
+          {@html icon("ext")}
+        </a>
+      </div>
     </div>
 
-    <div class="seg" role="group" aria-label="Режим обновлений">
-      <button type="button" class:on={!automatic} aria-pressed={!automatic}
-        disabled={!!pending} onclick={() => setAutomatic(false)}>Вручную</button>
-      <button type="button" class:on={automatic} aria-pressed={automatic}
-        disabled={!!pending} onclick={() => setAutomatic(true)}>Автообновление</button>
-    </div>
-    <small class="muted">
-      {#if automatic}
-        Прошивка и плагины обновляются сами с 3 до 6 утра, когда колонка молчит{update.checked ? ` · проверено ${update.checked}` : ""}
-      {:else if !update.repo}
-        Укажите репозиторий обновлений или выберите файл с компьютера.
-      {:else}
-        Прошивка и плагины обновляются вручную
-      {/if}
-    </small>
-
-    <label class="sw hu">
-      <input type="checkbox" checked={update.stats} disabled={!!pending} onchange={setStats} aria-label="Счётчик установок"
-        aria-describedby="update-stats-description">
-      <span class="tr"></span>
-      <span class="hu-t">
-        <b>Счётчик установок</b>
-        <small id="update-stats-description">Раз на версию колонка скачивает пустой файл с GitHub — так в README видно, сколько колонок с Джарвисом. Передаются только модель и версия.</small>
-      </span>
-    </label>
     {#if update.error}
-      <p class="err">{update.error}</p>
+      <p class={styles.errorBanner} role="alert">{update.error}</p>
     {/if}
-    {#if update.available && update.notes}
-      <details class={["mini", styles.release]}>
+
+    {#if update.available}
+      <div class={styles.releaseCard}>
+        <div class={styles.releaseHead}>
+          <div class={styles.releaseTitle}>
+            <span class={styles.releaseIcon} aria-hidden="true">{@html icon("bolt")}</span>
+            <div class={styles.releaseCopy}>
+              <b>Доступна версия {update.latest}</b>
+              <small>
+                Обновление по воздуху ·
+                <a class={styles.releaseLink} href={releaseUrl} target="_blank" rel="noopener noreferrer">
+                  Страница релиза
+                  {@html icon("ext")}
+                </a>
+              </small>
+            </div>
+          </div>
+          <button class="btn sm primary" type="button" disabled={!!pending} onclick={install}>
+            {pending === "install" ? "Скачиваю…" : `Обновить до ${update.latest}`}
+          </button>
+        </div>
+
+        {#if cleanNotes}
+          <div class={styles.changelog}>
+            <span class={styles.changelogLabel}>Что нового</span>
+            <div class={styles.notes}>{@html renderMarkdown(cleanNotes)}</div>
+          </div>
+        {/if}
+      </div>
+    {:else if cleanNotes && update.latest}
+      <details class={["mini", styles.currentNotes]}>
         <summary>Что нового в {update.latest}</summary>
-        <div class={styles.notes}>{@html renderMarkdown(update.notes)}</div>
+        <div class={styles.notes}>{@html renderMarkdown(cleanNotes)}</div>
       </details>
     {/if}
+
+    <div class={styles.prefs}>
+      <div class={styles.prefRow}>
+        <div class={styles.prefCopy}>
+          <b>Режим обновлений</b>
+          <small>
+            {#if automatic}
+              Прошивка и плагины обновляются сами с 3 до 6 утра, когда колонка молчит
+            {:else if !update.repo}
+              Укажите репозиторий обновлений или выберите файл с компьютера
+            {:else}
+              Прошивка и плагины обновляются вручную
+            {/if}
+          </small>
+        </div>
+        <div class="seg" role="group" aria-label="Режим обновлений">
+          <button
+            type="button"
+            class:on={!automatic}
+            aria-pressed={!automatic}
+            disabled={!!pending}
+            onclick={() => setAutomatic(false)}
+          >Вручную</button>
+          <button
+            type="button"
+            class:on={automatic}
+            aria-pressed={automatic}
+            disabled={!!pending}
+            onclick={() => setAutomatic(true)}
+          >Автообновление</button>
+        </div>
+      </div>
+
+      <div class={styles.prefDivider}></div>
+
+      <label class={["sw hu", styles.prefSwitch]}>
+        <input
+          type="checkbox"
+          checked={update.stats}
+          disabled={!!pending}
+          onchange={setStats}
+          aria-label="Счётчик установок"
+          aria-describedby="update-stats-description"
+        >
+        <span class="tr"></span>
+        <span class="hu-t">
+          <b>Счётчик установок</b>
+          <small id="update-stats-description">
+            Раз на версию колонка скачивает пустой файл с GitHub — так в README видно, сколько колонок с Джарвисом. Передаются только модель и версия.
+          </small>
+        </span>
+      </label>
+    </div>
   {:else}
     <p class="note">…</p>
   {/if}

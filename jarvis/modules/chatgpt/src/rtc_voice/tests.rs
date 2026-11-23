@@ -239,3 +239,199 @@ async fn voice_warm_builds_standby_without_socks_traffic_and_open_consumes_it() 
         remote.close().await.unwrap();
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn voice_say_waits_for_data_channel_open_after_dtls_connect() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let services: Callback = Arc::new(|method, _params| {
+            Box::pin(async move {
+                match method.as_str() {
+                    "network" => Ok(json!({})),
+                    "auth.get" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "voice.event" => Ok(json!(true)),
+                    _ => Err("unexpected service".into()),
+                }
+            })
+        });
+        let mut provider = ChatGpt::new(services);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        provider.call_url = format!("http://{}/call", listener.local_addr().unwrap());
+
+        let (channels, mut channel_rx) = tokio::sync::mpsc::channel(1);
+        let (audio, _audio_rx) = tokio::sync::mpsc::channel(8);
+        let gathered = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(PeerHandler { gathered: gathered.clone(), channel: channels, audio });
+        let mut media = MediaEngine::default();
+        media.register_codec(RTCRtpCodecParameters {
+            rtp_codec: RTCRtpCodec { mime_type: "audio/opus".into(), clock_rate: 48000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".into(), rtcp_feedback: vec![] },
+            payload_type: 111,
+            ..Default::default()
+        }, RtpCodecKind::Audio).unwrap();
+        let remote: Arc<dyn PeerConnection> = Arc::new(PeerConnectionBuilder::new().with_media_engine(media).with_handler(handler).with_runtime(Arc::new(webrtc::runtime::TokioRuntime)).with_udp_addrs(vec!["0.0.0.0:0".into()]).with_tcp_addrs(Vec::<String>::new()).build().await.unwrap());
+        let _guard = Guard(Some(remote.clone()));
+        let pc = remote.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend(&chunk[..n]);
+                if let Some(at) = request.windows(4).position(|v| v == b"\r\n\r\n") { break at + 4; }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:").map(str::trim)).unwrap().parse().unwrap();
+            while request.len() < header_end + length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend(&chunk[..n]);
+            }
+            let body: Value = serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+            pc.set_remote_description(RTCSessionDescription::offer(body["sdp"].as_str().unwrap().to_string()).unwrap()).await.unwrap();
+            let answer = pc.create_answer(None).await.unwrap();
+            pc.set_local_description(answer).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), gathered.notified()).await;
+            let answer = pc.local_description().await.unwrap().sdp;
+            socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", answer.len(), answer).as_bytes()).await.unwrap();
+        });
+
+        provider.request("voice.open", json!({"id":"say-race","profile":{"voice":"cove"},"instructions":"hi"})).await.unwrap();
+        server.await.unwrap();
+        provider.request("voice.say", json!({"id":"say-race","text":"сразу после dtls"})).await.unwrap();
+        let channel = channel_rx.recv().await.unwrap();
+        loop {
+            if let Some(DataChannelEvent::OnMessage(message)) = channel.poll().await {
+                let event: Value = serde_json::from_slice(&message.data).unwrap();
+                assert_eq!(event["type"], "session.context.append");
+                assert_eq!(event["content"][0]["text"], "сразу после dtls");
+                break;
+            }
+        }
+        provider.shutdown().await;
+        remote.close().await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn rtp_playout_recovers_from_150ms_stall_without_dropping_packets() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (events, mut event_rx) = tokio::sync::mpsc::channel(256);
+        let services: Callback = Arc::new(move |method, params| {
+            let events = events.clone();
+            Box::pin(async move {
+                match method.as_str() {
+                    "network" => Ok(json!({})),
+                    "auth.get" => Ok(json!({"access":"test-access","account":"test-account","refresh":"test-refresh","expires":super::super::now()+3600})),
+                    "voice.event" => { events.send(params).await.map_err(|e| e.to_string())?; Ok(json!(true)) }
+                    _ => Err("unexpected service".into()),
+                }
+            })
+        });
+        let mut provider = ChatGpt::new(services);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        provider.call_url = format!("http://{}/call", listener.local_addr().unwrap());
+
+        let (channels, mut channel_rx) = tokio::sync::mpsc::channel(1);
+        let (audio, _audio_rx) = tokio::sync::mpsc::channel(8);
+        let gathered = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(PeerHandler { gathered: gathered.clone(), channel: channels, audio });
+        let mut media = MediaEngine::default();
+        media.register_codec(RTCRtpCodecParameters {
+            rtp_codec: RTCRtpCodec { mime_type: "audio/opus".into(), clock_rate: 48000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".into(), rtcp_feedback: vec![] },
+            payload_type: 111,
+            ..Default::default()
+        }, RtpCodecKind::Audio).unwrap();
+        let remote: Arc<dyn PeerConnection> = Arc::new(
+            PeerConnectionBuilder::new()
+                .with_media_engine(media)
+                .with_handler(handler)
+                .with_runtime(Arc::new(webrtc::runtime::TokioRuntime))
+                .with_udp_addrs(vec!["0.0.0.0:0".into()])
+                .with_tcp_addrs(Vec::<String>::new())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let remote_ssrc = 0x54455355;
+        let remote_codec = RTCRtpCodec { mime_type: "audio/opus".into(), clock_rate: 48000, channels: 2, sdp_fmtp_line: "minptime=10;useinbandfec=1".into(), rtcp_feedback: vec![] };
+        let remote_track = Arc::new(TrackLocalStaticSample::new(
+            Instant::now(),
+            MediaStreamTrack::new("peer".into(), "audio".into(), "peer".into(), RtpCodecKind::Audio, vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(remote_ssrc), ..Default::default() },
+                codec: remote_codec,
+                ..Default::default()
+            }]),
+        ).unwrap());
+        remote.add_track(remote_track.clone() as Arc<dyn TrackLocal>).await.unwrap();
+        let _guard = Guard(Some(remote.clone()));
+        let pc = remote.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend(&chunk[..n]);
+                if let Some(at) = request.windows(4).position(|v| v == b"\r\n\r\n") { break at + 4; }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:").map(str::trim)).unwrap().parse().unwrap();
+            while request.len() < header_end + length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend(&chunk[..n]);
+            }
+            let body: Value = serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+            pc.set_remote_description(RTCSessionDescription::offer(body["sdp"].as_str().unwrap().to_string()).unwrap()).await.unwrap();
+            let answer = pc.create_answer(None).await.unwrap();
+            pc.set_local_description(answer).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), gathered.notified()).await;
+            let answer = pc.local_description().await.unwrap().sdp;
+            socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", answer.len(), answer).as_bytes()).await.unwrap();
+        });
+
+        provider.request("voice.open", json!({"id":"stall-call","profile":{"voice":"cove"},"instructions":"hi"})).await.unwrap();
+        server.await.unwrap();
+        let _channel = channel_rx.recv().await.unwrap();
+
+        let frames = 60usize;
+        let started = Instant::now();
+        let send = async {
+            let mut encoder = opus::Encoder::new().unwrap();
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            for index in 0..frames {
+                tick.tick().await;
+                if index == 20 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                let pcm: Vec<i16> = (0..320).map(|sample| {
+                    let phase = (index * 320 + sample) as f64 * std::f64::consts::TAU * 220.0 / 16000.0;
+                    (phase.sin() * 5000.0) as i16
+                }).collect();
+                let packet = encoder.encode(&pcm).unwrap();
+                remote_track.write_sample(remote_ssrc, 111, &rtc::media::Sample {
+                    data: packet.into(),
+                    duration: Duration::from_millis(20),
+                    ..rtc::media::Sample::new(Instant::now())
+                }, &[]).await.unwrap();
+            }
+        };
+        let receive = async {
+            let mut received = 0usize;
+            while received < frames {
+                let event = event_rx.recv().await.unwrap();
+                if event["kind"].as_str() == Some("audio") {
+                    received += 1;
+                }
+            }
+            received
+        };
+        let (_, received) = tokio::join!(send, receive);
+        assert_eq!(received, frames);
+        assert!(started.elapsed() < Duration::from_millis(frames as u64 * 20 + 600), "stalled playout drifted: {:?}", started.elapsed());
+        provider.shutdown().await;
+        remote.close().await.unwrap();
+    }).await.unwrap();
+}

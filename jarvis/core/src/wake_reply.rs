@@ -1,6 +1,5 @@
-use super::{Engine, INTERRUPTED, Mode, Profile, RATE, Settings, voice_preview};
+use super::{Engine, INTERRUPTED, Mode, Profile, Settings, voice_preview};
 use std::{
-    borrow::Cow,
     fs,
     path::Path,
     sync::{Arc, atomic::Ordering},
@@ -24,87 +23,6 @@ const PHRASES: &[&str] = &[
 pub(super) const FOLLOW_ON_GAP: Duration = Duration::from_millis(70);
 const MAX_REPLY: Duration = Duration::from_millis(900);
 const CACHE_BUDGET: u64 = 2 << 20;
-
-const MAX_ECHO_DELAY: Duration = Duration::from_millis(420);
-
-/// Subtract the matching playback signal during the short local acknowledgement.
-/// The mic stays live and frames unrelated to the clip pass through unchanged.
-pub(super) struct WakeEcho {
-    start: Instant,
-    reference: Vec<i16>,
-}
-
-impl WakeEcho {
-    fn new(sample: &voice_preview::Sample) -> Self {
-        let reference = (0..sample.pcm.len() * RATE / sample.rate)
-            .map(|index| {
-                let position = index * sample.rate;
-                let left = position / RATE;
-                let fraction = (position % RATE) as f32 / RATE as f32;
-                let a = f32::from(sample.pcm[left]);
-                let b = f32::from(*sample.pcm.get(left + 1).unwrap_or(&0));
-                (a + (b - a) * fraction) as i16
-            })
-            .collect();
-        Self { start: Instant::now(), reference }
-    }
-
-    pub(super) fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.start) > MAX_ECHO_DELAY
-            + Duration::from_secs_f64(self.reference.len() as f64 / RATE as f64)
-    }
-
-    pub(super) fn filter<'a>(&self, mic: &'a [i16], now: Instant) -> Cow<'a, [i16]> {
-        let elapsed = now.saturating_duration_since(self.start);
-        let latest = (elapsed.as_secs_f64() * RATE as f64).round() as usize;
-        let earliest = latest.saturating_sub((MAX_ECHO_DELAY.as_secs_f64() * RATE as f64) as usize);
-        if mic.len() < 64 || latest < mic.len() || self.reference.len() < mic.len() {
-            return Cow::Borrowed(mic);
-        }
-        let energy = mic.iter().step_by(8).map(|&x| f32::from(x).powi(2)).sum::<f32>();
-        if energy < 1.0 {
-            return Cow::Borrowed(mic);
-        }
-        let from = earliest.saturating_sub(mic.len());
-        let to = (latest - mic.len()).min(self.reference.len() - mic.len());
-        let mut best = (0.0, 0);
-        for offset in from..=to {
-            let reference = &self.reference[offset..offset + mic.len()];
-            let (dot, power) = reference.iter().zip(mic).step_by(8).fold(
-                (0.0, 0.0),
-                |(dot, power), (&speaker, &input)| {
-                    let speaker = f32::from(speaker);
-                    (dot + speaker * f32::from(input), power + speaker * speaker)
-                },
-            );
-            if power > 400.0 {
-                let score = (dot * dot) / (power * energy);
-                if score > best.0 {
-                    best = (score, offset);
-                }
-            }
-        }
-        let (score, offset) = best;
-        if score < 0.48 {
-            return Cow::Borrowed(mic);
-        }
-        let matched = mic.iter().zip(&self.reference[offset..offset + mic.len()]);
-        let (dot, speaker_power, mic_power) = matched.clone().fold(
-            (0.0, 0.0, 0.0),
-            |(dot, speaker_power, mic_power), (&input, &speaker)| {
-                let (input, speaker) = (f32::from(input), f32::from(speaker));
-                (dot + input * speaker, speaker_power + speaker * speaker, mic_power + input * input)
-            },
-        );
-        if dot * dot < 0.55 * speaker_power * mic_power {
-            return Cow::Borrowed(mic);
-        }
-        let gain = dot / speaker_power;
-        Cow::Owned(matched.map(|(&input, &speaker)| {
-            (f32::from(input) - gain * f32::from(speaker)).round() as i16
-        }).collect())
-    }
-}
 
 fn identity(profile: &Profile) -> (&str, &str, &str, &str) {
     let engine = if profile.is_classic() {
@@ -257,12 +175,10 @@ impl Engine {
         }
         self.player.set_boost(sample.boost * 0.65);
         self.leds.set(Mode::Listening);
-        self.st.lock().unwrap().wake_echo = Some(WakeEcho::new(sample));
         if self.player.write(&sample.pcm).is_ok() {
             log::info!("Отклик на активацию из кеша ({engine}) за {:.2} с", opening_at.elapsed().as_secs_f64());
             self.player.finish(MAX_REPLY + Duration::from_millis(200));
         } else {
-            self.st.lock().unwrap().wake_echo = None;
             self.player.stop(true);
         }
     }
@@ -275,20 +191,6 @@ fn short_enough(sample: &voice_preview::Sample) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn removes_the_delayed_acknowledgement_without_discarding_speech() {
-        let sample = voice_preview::Sample { rate: RATE, boost: 1.0, pcm: (0usize..3200)
-            .map(|i| ((i * i * 311 + i * 79) % 6000) as i16 - 3000).collect() };
-        let echo = WakeEcho::new(&sample);
-        let now = echo.start + Duration::from_millis(156);
-        let speech: Vec<i16> = (0..320).map(|i| if i % 17 < 8 { 260 } else { -260 }).collect();
-        let mix: Vec<i16> = sample.pcm[897..1217].iter().zip(&speech)
-            .map(|(sample, voice)| sample / 2 + voice).collect();
-        let clean = echo.filter(&mix, now);
-        assert!(clean.iter().zip(&speech).all(|(input, expected)| (input - expected).abs() < 150));
-        assert_eq!(echo.filter(&speech, now).as_ref(), speech);
-    }
 
     #[test]
     fn wake_replies_are_separate_for_each_voice_and_model() {

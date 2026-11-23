@@ -1,7 +1,7 @@
 {
   "id": "vpn",
   "name": "VPN",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Подключение по ссылке VLESS для выбранных сервисов.",
   "kind": "rust",
   "main": "plugin",
