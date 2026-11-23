@@ -36,9 +36,9 @@ pub struct Tools {
 
 pub(crate) fn play_music_def(who: &str) -> Value {
     json!({"type": "function", "name": "play_music",
-        "description": format!("Включить музыку, подкаст или видео на колонке. По умолчанию ищет в Spotify, при неудаче — на YouTube. source=youtube — для видео: обзоры, ролики, концерты, каверы, «на ютубе». kind=liked/liked_shuffle/wave — «моё любимое», «любимое вперемешку», «рекомендации/моя волна». {who} Если сказали только «включи на YouTube трек», сначала спроси название или исполнителя. Подбирай сам, когда об этом попросили. Не обещай «сейчас поищу» без вызова."),
+        "description": format!("Включить музыку, подкаст или видео на колонке. По умолчанию ищет в Spotify, при неудаче — на YouTube. source=youtube — для видео: обзоры, ролики, концерты, каверы, «на ютубе». kind=liked/liked_shuffle/wave — «моё любимое», «мои лайки», «любимое вперемешку», «рекомендации/моя волна» (это Spotify). Лайки и плейлисты YouTube — только если назвали YouTube или сохранённый плейлист: source=youtube, query «мои лайки» или «плейлист <название>». {who} Если сказали только «включи на YouTube трек», сначала спроси название или исполнителя. Подбирай сам, когда об этом попросили. Не обещай «сейчас поищу» без вызова."),
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "что искать: исполнитель и название"},
+            "query": {"type": "string", "description": "что искать: исполнитель и название; для YouTube также «мои лайки» / «понравившиеся» или «плейлист <название>»"},
             "source": {"type": "string", "enum": ["auto", "spotify", "youtube"], "description": "auto (по умолчанию) — сначала Spotify, потом YouTube; youtube — видео и ролики"},
             "kind": {"type": "string", "enum": ["any", "track", "artist", "album", "playlist", "podcast", "liked", "liked_shuffle", "wave"], "description": "что искать; liked — моё любимое, liked_shuffle — любимое вперемешку, wave — рекомендации/моя волна (query можно не заполнять)"},
             "queue": {"type": "boolean", "description": "true — не включать сразу, а добавить в очередь YouTube после того, что играет («добавь в очередь», «потом включи»)"},
@@ -221,7 +221,7 @@ impl Tools {
         }
         if self.music.is_some() && self.host.provider("youtube").is_ok() {
             let who = if self.use_ch("yandexmusic") {
-                "Обычную музыку по названию включает Алиса. Если явно просят YouTube, используй этот инструмент."
+                "Обычную музыку по названию включает Алиса. Но если просят YouTube, свои лайки/понравившиеся или плейлист (и не упомянули Яндекс/Алису), всегда используй play_music, а не alice_command."
             } else {
                 "Яндекс Музыка выключена в настройках: любую музыку, песню или радио включай только этим инструментом, сразу, запрос придумай сам, если не назвали."
             };
@@ -235,7 +235,16 @@ impl Tools {
                     "required": ["command"]}}));
         }
         if self.use_ch("alice") {
-            defs.push(def("alice_command"));
+            let mut alice_tool = def("alice_command");
+            if self.music.is_some()
+                && self.host.provider("youtube").is_ok()
+                && let Some(desc) = alice_tool.get("description").and_then(Value::as_str)
+            {
+                alice_tool["description"] = Value::String(format!(
+                    "{desc} Лайки и плейлисты YouTube не передавай сюда — для них используй play_music."
+                ));
+            }
+            defs.push(alice_tool);
         }
         if self.memory.as_ref().is_some_and(|m| m.enabled()) {
             defs.push(def("recall_conversation"));

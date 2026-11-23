@@ -106,7 +106,10 @@
 </section>
 
 <section class="sec">
-  <div class="sec-h"><h2>Обновления</h2></div>
+  <div class="sec-h">
+    <h2>Обновления</h2>
+    <p>Версия прошивки, список изменений и расписание автообновления</p>
+  </div>
   <div class="sec-b"><Updates /></div>
 </section>
 

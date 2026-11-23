@@ -38,7 +38,7 @@ impl ChatGpt {
         let generation=self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let stale={
             let mut slot=self.standby.lock().unwrap();
-            if slot.as_ref().is_some_and(|peer|peer.matches(network)){return;}
+            if slot.as_ref().is_some_and(|peer|peer.fresh_for_warm(network)){return;}
             slot.take()
         };
         if let Some(peer)=stale{peer.close().await;}
@@ -81,7 +81,7 @@ impl ChatGpt {
                         // Reuse DNS, SOCKS, H2 TLS, access token and a local WebRTC PeerConnection without opening an OpenAI call.
                         let _=tokio::join!(
                             self.token_with_margin(900),
-                            async{let _=client.head(url).timeout(Duration::from_secs(4)).send().await;},
+                            async{if let Ok(response)=client.head(url).timeout(Duration::from_secs(4)).send().await{let _=response.bytes().await;}},
                             self.ensure_standby(&network),
                         );
                     }
@@ -177,9 +177,9 @@ fn client(network:&Value)->Result<reqwest::Client,String>{
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
-        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .tcp_keepalive(Some(Duration::from_secs(20)))
+        .pool_idle_timeout(Some(Duration::from_secs(120)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(20)))
         .http2_keep_alive_while_idle(true);
     if let Some(socks)=network["socks"].as_str(){let addr:SocketAddr=socks.parse().map_err(|_|"Неверный SOCKS VPN")?;let user=network["user"].as_str().unwrap_or("");let pass=network["pass"].as_str().unwrap_or("");if !addr.ip().is_loopback()||addr.port()==0||user.is_empty()||pass.is_empty(){return Err("Неверный SOCKS VPN".into());}builder=builder.proxy(reqwest::Proxy::all(format!("socks5h://{socks}")).map_err(|_|"Неверный SOCKS VPN")?.basic_auth(user,pass));}
     builder.build().map_err(|_|"Не создать клиент ChatGPT".into())

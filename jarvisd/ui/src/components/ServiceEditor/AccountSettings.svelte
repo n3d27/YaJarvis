@@ -8,6 +8,12 @@
   let devices = $derived(account.devices || []);
   let local = $derived(devices.filter((device) => device.local).length);
   let youtube = $derived(account.account || {});
+  let ytName = $derived(youtube.name && youtube.name !== "Аккаунт Google" ? youtube.name : "");
+  let ytIdentity = $derived(
+    [youtube.handle, youtube.email]
+      .filter((v, i, arr) => v && arr.indexOf(v) === i && v !== ytName)
+      .join(" · "),
+  );
   let smartLife = $derived(id === "smartlife");
 </script>
 
@@ -43,8 +49,23 @@
       <small class="muted">окно само увидит вход</small>
     </div>
   {:else if youtube.signed_in}
-    <div class="cn-ok">{@html icon("done")}<span>Колонка вошла в YouTube<small>видео 18+ тоже играют</small></span></div>
+    <div class="cn-ok">
+      {@html icon("done")}
+      <span>
+        Колонка вошла в YouTube{#if ytName} · <b>{ytName}</b>{:else if youtube.name} · <b>{youtube.name}</b>{/if}
+        <small>{[ytIdentity, "видео 18+ и медиатека доступны"].filter(Boolean).join(" · ")}</small>
+      </span>
+    </div>
   {:else}
+    {#if account.set}
+      <div class="cn-ok">
+        {@html icon("done")}
+        <span>
+          Куки YouTube загружены{#if ytName} · <b>{ytName}</b>{/if}
+          <small>{[ytIdentity, "вход по кукам браузера"].filter(Boolean).join(" · ")}</small>
+        </span>
+      </div>
+    {/if}
     {#if youtube.error}<p class="err">{youtube.error}</p>{/if}
     <div class="row"><button type="button" class="btn primary" id="ya-in" onclick={action}>Войти в YouTube</button><small class="muted">кодом, как на телевизоре — пароль колонка не видит</small></div>
     <details class="mini">

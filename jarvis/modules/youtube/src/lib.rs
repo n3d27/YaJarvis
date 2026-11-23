@@ -5,8 +5,8 @@ mod remote;
 
 use account::{Account, COOKIES};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use jarvis_home_common::{Host, load, save, text};
-use remote::{Remote, Stream, Track, valid_id, video_id};
+use jarvis_home_common::{Host, load, normal, random, save, text};
+use remote::{Playlist, Remote, Stream, Track, playlist_id_from_url, valid_id, valid_playlist_id, video_id};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,6 +24,22 @@ use tokio::{
 };
 
 const HISTORY: &str = "youtube-progress.json";
+const LIBRARY_CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Default)]
+struct LibraryCache {
+    liked: Option<(Instant, Vec<Track>)>,
+    playlists: Option<(Instant, Vec<Playlist>)>,
+    items: BTreeMap<String, (Instant, Vec<Track>)>,
+}
+
+impl LibraryCache {
+    fn clear(&mut self) {
+        self.liked = None;
+        self.playlists = None;
+        self.items.clear();
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
@@ -113,10 +129,11 @@ impl State {
 pub struct Youtube {
     host: Arc<Host>,
     account: Arc<Account>,
-    remote: Remote,
+    remote: Arc<Remote>,
     state: Mutex<State>,
     ready: OnceCell<()>,
     request: AsyncMutex<()>,
+    library_cache: AsyncMutex<LibraryCache>,
     save_lock: Arc<AsyncMutex<()>>,
     wake: Notify,
     closed: AtomicBool,
@@ -127,12 +144,13 @@ impl Youtube {
     pub fn new(host: Host) -> Self {
         let host = Arc::new(host);
         Self {
-            remote: Remote::new(host.clone()),
+            remote: Arc::new(Remote::new(host.clone())),
             account: Arc::new(Account::new(host.clone())),
             host,
             state: Mutex::default(),
             ready: OnceCell::default(),
             request: AsyncMutex::default(),
+            library_cache: AsyncMutex::default(),
             save_lock: Arc::new(AsyncMutex::default()),
             wake: Notify::new(),
             closed: AtomicBool::new(false),
@@ -482,6 +500,7 @@ impl Youtube {
         let mut pending: VecDeque<_> = tracks.into();
         let mut last = String::new();
         let mut retries = 0;
+        let mut preplay_skips = 0usize;
         let mut force_tv = false;
         let mut finished_selection = None;
         while let Some(track) = pending.pop_front() {
@@ -496,6 +515,13 @@ impl Youtube {
                 Err(e) => {
                     last = e;
                     force_tv = false;
+                    if pending.is_empty()
+                        && preplay_skips < 5
+                        && let Some(next) = self.pop_next_queued(generation)
+                    {
+                        preplay_skips += 1;
+                        pending.push_back(next);
+                    }
                     continue;
                 }
             };
@@ -533,7 +559,11 @@ impl Youtube {
                 } else if !same_track {
                     state.related.clear();
                 }
-                radio && !state.personal && pending.is_empty() && state.related.is_empty()
+                radio
+                    && !state.personal
+                    && pending.is_empty()
+                    && state.queue.len() < 20
+                    && state.related.is_empty()
             };
             log::debug!("YouTube: аудио {} Opus {}", source.client, source.itag);
             let repeat_source = source.clone();
@@ -616,11 +646,19 @@ impl Youtube {
                         break;
                     }
                     force_tv = false;
+                    if pending.is_empty()
+                        && preplay_skips < 5
+                        && let Some(next) = self.pop_next_queued(generation)
+                    {
+                        preplay_skips += 1;
+                        pending.push_back(next);
+                    }
                     continue;
                 }
                 Ok(()) => {
                     last.clear();
                     retries = 0;
+                    preplay_skips = 0;
                     start = 0.0;
                     force_tv = false;
                     keep_playing = true;
@@ -726,11 +764,25 @@ impl Youtube {
             .collect())
     }
 
+    fn pop_next_queued(&self, generation: u64) -> Option<Track> {
+        let mut state = self.state.lock().unwrap();
+        if state.generation == generation {
+            state.queue.pop_front()
+        } else {
+            None
+        }
+    }
+
     async fn launch_query(self: &Arc<Self>, op: &str, args: &Value) -> Result<Value, String> {
         let lock = self.request.lock().await;
         let query = text(&args["query"]);
         let (tracks, start) = match op {
             "play" => {
+                if let Some(pid) = playlist_id_from_url(&query) {
+                    drop(lock);
+                    let res = self.play_playlist_op(&json!({"id": pid})).await?;
+                    return Ok(res["track"].clone());
+                }
                 let tracks = self.search(&query, false).await?;
                 self.state.lock().unwrap().personal = false;
                 (tracks, 0.0)
@@ -1005,6 +1057,16 @@ impl Youtube {
                 Ok(self.state.lock().unwrap().snapshot(radio))
             }
             "play" | "play_id" | "next" | "resume_saved" => self.launch_query(op, args).await,
+            "library" => self.load_library(args["refresh"] == true).await,
+            "playlist_items" => {
+                let id = text(&args["id"]).trim().to_string();
+                let tracks = self
+                    .load_playlist_items(&id, args["refresh"] == true)
+                    .await?;
+                Ok(json!({"id": id, "tracks": tracks}))
+            }
+            "play_liked" => self.play_liked_op(args).await,
+            "play_playlist" => self.play_playlist_op(args).await,
             "enqueue" => {
                 let _lock = self.request.lock().await;
                 let track = self
@@ -1055,23 +1117,380 @@ impl Youtube {
                 self.account
                     .set_cookies(&self.remote, args["cookies"].as_str().unwrap_or_default())
                     .await?;
+                self.account.clear_profile_cache().await;
+                self.library_cache.lock().await.clear();
                 Ok(Value::Null)
             }
             "cookies_clear" => {
                 self.account.clear_cookies()?;
+                self.account.clear_profile_cache().await;
+                self.library_cache.lock().await.clear();
                 Ok(Value::Null)
             }
             "account" => {
-                Ok(json!({"set":self.account.has_cookies(),"account":self.account.state().await?}))
+                Ok(json!({"set":self.account.has_cookies(),"account":self.account.state(&self.remote).await?}))
             }
-            "account_begin" => self.account.begin().await,
+            "account_begin" => self.account.begin(&self.remote).await,
             "account_logout" => {
                 self.account.logout().await?;
+                self.library_cache.lock().await.clear();
                 Ok(Value::Null)
             }
             _ => Err("Неизвестная команда плеера".into()),
         }
     }
+
+    async fn auth_headers(&self) -> Result<HeaderMap, String> {
+        if !self.account.is_signed_in().await {
+            return Ok(HeaderMap::new());
+        }
+        self.account.headers(false).await
+    }
+
+    async fn load_library(&self, refresh: bool) -> Result<Value, String> {
+        let headers = self.auth_headers().await?;
+        if headers.is_empty() {
+            return Ok(json!({"signed_in": false, "liked": [], "playlists": []}));
+        }
+        let (cached_liked, cached_playlists) = if refresh {
+            (None, None)
+        } else {
+            let cache = self.library_cache.lock().await;
+            (
+                cache
+                    .liked
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < LIBRARY_CACHE_TTL)
+                    .map(|(_, v)| v.clone()),
+                cache
+                    .playlists
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < LIBRARY_CACHE_TTL)
+                    .map(|(_, v)| v.clone()),
+            )
+        };
+
+        let liked_fut = async {
+            match cached_liked {
+                Some(v) => Ok(v),
+                None => self.remote.liked_tracks(headers.clone(), 100).await,
+            }
+        };
+        let playlists_fut = async {
+            match cached_playlists {
+                Some(v) => Ok(v),
+                None => self.remote.playlists(headers.clone()).await,
+            }
+        };
+        let (liked_res, playlists_res) = tokio::join!(liked_fut, playlists_fut);
+
+        if let Err(ref e) = liked_res
+            && e.contains("войти заново")
+        {
+            return Err(e.clone());
+        }
+        if let Err(ref e) = playlists_res
+            && e.contains("войти заново")
+        {
+            return Err(e.clone());
+        }
+
+        let mut error = String::new();
+        let liked = match liked_res {
+            Ok(v) => {
+                let mut cache = self.library_cache.lock().await;
+                cache.liked = Some((Instant::now(), v.clone()));
+                v
+            }
+            Err(e) => {
+                error = e;
+                Vec::new()
+            }
+        };
+        let playlists = match playlists_res {
+            Ok(v) => {
+                let mut cache = self.library_cache.lock().await;
+                cache.playlists = Some((Instant::now(), v.clone()));
+                v
+            }
+            Err(e) => {
+                if error.is_empty() {
+                    error = e;
+                }
+                Vec::new()
+            }
+        };
+        if !error.is_empty() && liked.is_empty() && playlists.is_empty() {
+            return Err(error);
+        }
+        let mut out = json!({
+            "signed_in": true,
+            "liked": liked,
+            "playlists": playlists
+        });
+        if !error.is_empty() {
+            out["error"] = error.into();
+        }
+        Ok(out)
+    }
+
+    async fn load_playlist_items(&self, id: &str, refresh: bool) -> Result<Vec<Track>, String> {
+        if !valid_playlist_id(id) {
+            return Err("Неверный ID плейлиста YouTube".into());
+        }
+        if !refresh {
+            let cache = self.library_cache.lock().await;
+            if let Some((at, tracks)) = cache.items.get(id)
+                && at.elapsed() < LIBRARY_CACHE_TTL
+            {
+                return Ok(tracks.clone());
+            }
+        }
+        let headers = self.auth_headers().await.unwrap_or_default();
+        let tracks = self.remote.playlist_tracks(id, headers, 100).await?;
+        let mut cache = self.library_cache.lock().await;
+        if cache.items.len() >= 24 {
+            cache.items.clear();
+        }
+        cache
+            .items
+            .insert(id.to_string(), (Instant::now(), tracks.clone()));
+        Ok(tracks)
+    }
+
+    async fn play_liked_op(self: &Arc<Self>, args: &Value) -> Result<Value, String> {
+        let lock = self.request.lock().await;
+        let headers = self.auth_headers().await?;
+        if headers.is_empty() {
+            return Err("Чтобы слушать лайки, войдите в аккаунт YouTube в настройках.".into());
+        }
+        let cached = {
+            let cache = self.library_cache.lock().await;
+            cache
+                .liked
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < LIBRARY_CACHE_TTL)
+                .map(|(_, v)| v.clone())
+        };
+        let tracks = match cached {
+            Some(v) => v,
+            None => {
+                let fresh = self.remote.liked_tracks(headers, 100).await?;
+                self.library_cache.lock().await.liked = Some((Instant::now(), fresh.clone()));
+                fresh
+            }
+        };
+        if tracks.is_empty() {
+            return Err("В аккаунте YouTube пока нет понравившихся видео".into());
+        }
+        let index = args["index"].as_u64().unwrap_or(0) as usize;
+        let shuffle = args["shuffle"] == true;
+        let queue = args["queue"] == true;
+        let (started, count) = self.play_track_list(lock, tracks, index, shuffle, queue).await?;
+        Ok(json!({"track": started, "count": count}))
+    }
+
+    async fn play_playlist_op(self: &Arc<Self>, args: &Value) -> Result<Value, String> {
+        let lock = self.request.lock().await;
+        let raw_id = text(&args["id"]).trim().to_string();
+        let raw_query = text(&args["query"]).trim().to_string();
+        let index = args["index"].as_u64().unwrap_or(0) as usize;
+        let shuffle = args["shuffle"] == true;
+        let queue = args["queue"] == true;
+
+        let id = if !raw_id.is_empty() {
+            raw_id
+        } else if let Some(parsed) = playlist_id_from_url(&raw_query) {
+            parsed
+        } else {
+            String::new()
+        };
+
+        if !id.is_empty() {
+            let tracks = self.load_playlist_items(&id, false).await?;
+            if tracks.is_empty() {
+                return Err("Плейлист пуст или недоступен".into());
+            }
+            let title = {
+                let cache = self.library_cache.lock().await;
+                cache
+                    .playlists
+                    .as_ref()
+                    .and_then(|(_, pls)| pls.iter().find(|p| p.id == id))
+                    .map(|p| p.title.clone())
+                    .unwrap_or_default()
+            };
+            let (started, count) = self
+                .play_track_list(lock, tracks, index, shuffle, queue)
+                .await?;
+            return Ok(json!({"track": started, "count": count, "playlist": title}));
+        }
+
+        if raw_query.is_empty() {
+            return Err("Укажите название плейлиста".into());
+        }
+
+        let headers = self.auth_headers().await.unwrap_or_default();
+        if !headers.is_empty() {
+            let saved = {
+                let cache = self.library_cache.lock().await;
+                cache
+                    .playlists
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < LIBRARY_CACHE_TTL)
+                    .map(|(_, v)| v.clone())
+            };
+            let saved = match saved {
+                Some(v) => v,
+                None => match self.remote.playlists(headers.clone()).await {
+                    Ok(v) => {
+                        self.library_cache.lock().await.playlists =
+                            Some((Instant::now(), v.clone()));
+                        v
+                    }
+                    Err(_) => Vec::new(),
+                },
+            };
+            if let Some(matched) = match_saved_playlist(&saved, &raw_query).cloned() {
+                if let Ok(tracks) = self.load_playlist_items(&matched.id, false).await
+                    && !tracks.is_empty()
+                {
+                    let (started, count) = self
+                        .play_track_list(lock, tracks, index, shuffle, queue)
+                        .await?;
+                    return Ok(json!({
+                        "track": started,
+                        "count": count,
+                        "playlist": matched.title
+                    }));
+                }
+            }
+        }
+
+        if let Ok(found) = self.remote.search_playlists(&raw_query, HeaderMap::new()).await {
+            for pl in found.into_iter().take(3) {
+                if let Ok(tracks) = self.load_playlist_items(&pl.id, false).await
+                    && !tracks.is_empty()
+                {
+                    let (started, count) = self
+                        .play_track_list(lock, tracks, index, shuffle, queue)
+                        .await?;
+                    return Ok(json!({
+                        "track": started,
+                        "count": count,
+                        "playlist": pl.title
+                    }));
+                }
+            }
+        }
+
+        let tracks = self.search(&format!("{raw_query} плейлист"), false).await?;
+        if tracks.is_empty() {
+            return Err("Плейлист не найден на YouTube".into());
+        }
+        let (started, count) = self
+            .play_track_list(lock, tracks, index, shuffle, queue)
+            .await?;
+        Ok(json!({"track": started, "count": count, "playlist": ""}))
+    }
+
+    async fn play_track_list(
+        self: &Arc<Self>,
+        lock: tokio::sync::MutexGuard<'_, ()>,
+        mut tracks: Vec<Track>,
+        start_index: usize,
+        shuffle: bool,
+        enqueue_only: bool,
+    ) -> Result<(Track, usize), String> {
+        if tracks.is_empty() {
+            return Err("В списке нет доступных треков".into());
+        }
+        if shuffle {
+            shuffle_tracks(&mut tracks);
+        } else if start_index > 0 {
+            if start_index >= tracks.len() {
+                return Err("Трек не найден в списке".into());
+            }
+            tracks.drain(..start_index);
+        }
+        tracks.truncate(100);
+        if enqueue_only {
+            let first = tracks[0].clone();
+            let mut state = self.state.lock().unwrap();
+            let avail = 100usize.saturating_sub(state.queue.len());
+            if avail == 0 {
+                return Err("Очередь заполнена".into());
+            }
+            let added = tracks.len().min(avail);
+            for t in tracks.into_iter().take(added) {
+                state.queue.push_back(t);
+            }
+            return Ok((first, added));
+        }
+        let total = tracks.len();
+        let first = tracks.remove(0);
+        let (_, generation) = self.halt(false).await;
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation == generation {
+                state.personal = false;
+                state.related.clear();
+                state.queue = tracks.into();
+            }
+        }
+        let finished = self.launch(generation, vec![first], 0.0, None, false);
+        drop(lock);
+        let started = finished.await.map_err(|_| "Воспроизведение отменено")??;
+        Ok((started, total))
+    }
+}
+
+fn shuffle_tracks(tracks: &mut [Track]) {
+    if tracks.len() < 2 {
+        return;
+    }
+    for i in (1..tracks.len()).rev() {
+        let j = match random::<8>() {
+            Ok(bytes) => (u64::from_le_bytes(bytes) as usize) % (i + 1),
+            Err(_) => break,
+        };
+        tracks.swap(i, j);
+    }
+}
+
+pub(crate) fn match_saved_playlist<'a>(
+    playlists: &'a [Playlist],
+    query: &str,
+) -> Option<&'a Playlist> {
+    let q = normal(query);
+    if q.is_empty() {
+        return None;
+    }
+    if let Some(exact) = playlists.iter().find(|p| normal(&p.title) == q) {
+        return Some(exact);
+    }
+    let q_words: Vec<&str> = q.split_whitespace().collect();
+    let mut best: Option<(usize, &Playlist)> = None;
+    for p in playlists {
+        let title = normal(&p.title);
+        if title.is_empty() {
+            continue;
+        }
+        let matched = title.contains(&q)
+            || (!q_words.is_empty()
+                && q_words.iter().all(|w| {
+                    title
+                        .split_whitespace()
+                        .any(|tw| tw == *w || (w.chars().count() >= 3 && tw.starts_with(w)))
+                }));
+        if matched {
+            let diff = title.len().abs_diff(q.len());
+            if best.is_none_or(|(best_diff, _)| diff < best_diff) {
+                best = Some((diff, p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 fn genre_terms(query: &str) -> Option<&'static [&'static str]> {
@@ -1281,5 +1700,95 @@ mod tests {
         assert_eq!(cur["paused"], true);
         assert_eq!(cur["active"], true);
         assert_eq!(cur["cur"]["ID"], "dQw4w9WgXcQ");
+    }
+
+    #[tokio::test]
+    async fn saved_playlist_matching_shuffle_and_signed_out_guards() {
+        let pls = vec![
+            Playlist {
+                id: "PL1".into(),
+                title: "Lo-Fi Beats".into(),
+                ..Default::default()
+            },
+            Playlist {
+                id: "PL2".into(),
+                title: "Музыка в машину".into(),
+                ..Default::default()
+            },
+            Playlist {
+                id: "PL3".into(),
+                title: "Synthwave 2026".into(),
+                ..Default::default()
+            },
+            Playlist {
+                id: "PL4".into(),
+                title: "Музыка".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            match_saved_playlist(&pls, "lo-fi beats").map(|p| p.id.as_str()),
+            Some("PL1")
+        );
+        assert_eq!(
+            match_saved_playlist(&pls, "lo fi").map(|p| p.id.as_str()),
+            Some("PL1")
+        );
+        assert_eq!(
+            match_saved_playlist(&pls, "в машину").map(|p| p.id.as_str()),
+            Some("PL2")
+        );
+        assert_eq!(
+            match_saved_playlist(&pls, "synth").map(|p| p.id.as_str()),
+            Some("PL3")
+        );
+        assert_eq!(
+            match_saved_playlist(&pls, "музыка").map(|p| p.id.as_str()),
+            Some("PL4")
+        );
+        assert!(match_saved_playlist(&pls, "макробер музыка").is_none());
+        assert!(match_saved_playlist(&pls, "джаз").is_none());
+
+        let mut tracks: Vec<Track> = (0..10)
+            .map(|i| Track {
+                id: format!("id_{i}"),
+                title: format!("Title {i}"),
+                author: String::new(),
+            })
+            .collect();
+        shuffle_tracks(&mut tracks);
+        let mut ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            (0..10).map(|i| format!("id_{i}")).collect::<Vec<_>>()
+        );
+
+        let dir = std::env::temp_dir().join("jarvis-yt-lib-guard-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = Host::new(
+            Arc::new(|method, _| {
+                Box::pin(async move {
+                    if method == "config.get" {
+                        Ok(json!({"auth": {"refresh": "", "name": ""}}))
+                    } else {
+                        Ok(json!({}))
+                    }
+                })
+            }),
+            dir,
+        );
+        let yt = Arc::new(Youtube::new(host));
+        let lib = yt.command("library", &json!({})).await.unwrap();
+        assert_eq!(lib["signed_in"], false);
+
+        let err = yt.command("play_liked", &json!({})).await.unwrap_err();
+        assert!(err.contains("войдите"), "{err}");
+
+        let bad_pl = yt
+            .command("playlist_items", &json!({"id": "bad/id"}))
+            .await
+            .unwrap_err();
+        assert!(bad_pl.contains("Неверный ID"), "{bad_pl}");
     }
 }

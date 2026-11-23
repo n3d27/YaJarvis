@@ -27,7 +27,7 @@ pub const KEEP_CHARS: usize = 10000;
 const COMPACT_AT: usize = 9000;
 const COMPACT_KEEP: usize = 4500;
 const COMPACT_MAX: usize = 24000;
-const PROFILE_MAX: usize = 2000;
+const PROFILE_MAX: usize = 4000;
 const SUMMARY_MAX: usize = 2500;
 const CHRONICLE_MAX: usize = 1500;
 const COMPACT_IDLE: Duration = Duration::from_secs(45);
@@ -228,7 +228,7 @@ static COMPACT_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
 - О ХОЗЯИНЕ — досье: имя, близкие и питомцы, работа и учёба, вкусы (музыка, еда, фильмы, игры), привычки и распорядок, \
 здоровье (если сам рассказал), дом и устройства, планы и мечты, как с ним лучше говорить. Перенеси всё из прежнего досье и добавь новое. \
 Досье — СПИСКОМ: каждый факт на отдельной строке, начиная с «- », одна мысль на строку; сплошным абзацем не пиши. \
-Не длиннее 2000 знаков: когда места мало, объединяй и обобщай, но устойчивое не теряй.\n\
+Не длиннее 4000 знаков. Сохраняй ВСЕ факты из прежнего досье, включая локальные мемы, шутки, маты, особые фразы-реакции и пометки хозяина — ничего из прежнего досье не выкидывай и не цензурируй; когда места мало, сжимай формулировки, но смысл и детали не теряй.\n\
 - ДОГОВОРЁННОСТИ — обещания, планы, напоминания с датами; прошедшее и выполненное убирай.\n\
 - ХРОНОЛОГИЯ — по дням: о чём говорили и что решили. Свежие дни подробнее, старше недели — строка на день, старше месяца — строка на неделю. \
 Не длиннее 2000 знаков."
@@ -304,6 +304,84 @@ pub fn profile_lines(s: &str) -> String {
         out.push(format!("- {}", r[start..].iter().collect::<String>().trim()));
     }
     out.join("\n")
+}
+
+fn profile_terms(line: &str) -> Vec<String> {
+    let mut terms = recall_terms(line);
+    if terms.is_empty() {
+        for w in words(&line.to_lowercase().replace('ё', "е")) {
+            if w.chars().count() >= 2 && !terms.contains(&w) {
+                terms.push(w);
+            }
+        }
+    }
+    terms
+}
+
+fn line_covered_by(old_line: &str, new_lines: &[(String, Vec<String>)]) -> bool {
+    let body = old_line.trim().trim_start_matches(['-', '•', '*']).trim().to_lowercase();
+    if body.is_empty() {
+        return true;
+    }
+    let old_terms = profile_terms(old_line);
+    for (new_lower, new_words) in new_lines {
+        if new_lower.contains(&body) || body.contains(new_lower.as_str()) {
+            return true;
+        }
+        if !old_terms.is_empty() {
+            let need = if old_terms.len() <= 2 { old_terms.len() } else { old_terms.len().div_ceil(2) };
+            let matched = old_terms
+                .iter()
+                .filter(|t| new_words.iter().any(|w| w.starts_with(t.as_str())))
+                .count();
+            if matched >= need {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Объединить прежнее досье с обновлённым, не теряя факты, которые модель не упомянула.
+fn merge_profile(old: &str, new: &str, forget_terms: &[Vec<String>], max_chars: usize) -> String {
+    let old_norm = profile_lines(old);
+    let new_norm = profile_lines(new);
+    let new_entries: Vec<String> = new_norm.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let new_index: Vec<(String, Vec<String>)> = new_entries
+        .iter()
+        .map(|l| {
+            let body = l.trim().trim_start_matches(['-', '•', '*']).trim().to_lowercase();
+            let ws = words(&body.replace('ё', "е"));
+            (body, ws)
+        })
+        .collect();
+
+    let mut combined: Vec<String> = vec![];
+    for line in old_norm.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !forget_terms.is_empty() && forget_terms.iter().any(|t| !t.is_empty() && score_text(line, t) >= t.len()) {
+            continue;
+        }
+        if !line_covered_by(line, &new_index) {
+            combined.push(line.to_string());
+        }
+    }
+    for line in new_entries {
+        if !forget_terms.is_empty() && forget_terms.iter().any(|t| !t.is_empty() && score_text(&line, t) >= t.len()) {
+            continue;
+        }
+        if !combined.iter().any(|existing| existing == &line) {
+            combined.push(line);
+        }
+    }
+    let total_len = |lines: &[String]| lines.iter().map(|l| runes(l)).sum::<usize>() + lines.len().saturating_sub(1);
+    while combined.len() > 1 && total_len(&combined) > max_chars {
+        if let Some(pos) = combined.iter().position(|l| !l.to_lowercase().contains("попросил запомнить")) {
+            combined.remove(pos);
+        } else {
+            break;
+        }
+    }
+    clip(&combined.join("\n"), max_chars)
 }
 
 /// Убрать строки, где есть все слова.
@@ -682,6 +760,14 @@ impl Memory {
         }
     }
 
+    fn backup(&self) {
+        if let Ok(bytes) = std::fs::read(&self.path)
+            && !bytes.is_empty()
+        {
+            let _ = write_private(&self.path.with_extension("bak.json"), &bytes);
+        }
+    }
+
     fn save(&self, st: &St) {
         let Ok(b) = serde_json::to_vec(&st.d) else { return };
         let tmp = self.path.with_extension("json.tmp");
@@ -894,9 +980,10 @@ impl Memory {
         if st.d.id != id || st.epoch != epoch {
             return Ok(0); // пока сжимали, начали новый чат или стёрли память
         }
+        self.backup();
         let (profile, summary, ok) = sections(&out);
         if ok && st.profile_rev == rev {
-            st.d.profile = clip(&profile_lines(&profile), PROFILE_MAX * 3 / 2);
+            st.d.profile = merge_profile(&st.d.profile, &profile, &[], PROFILE_MAX * 3 / 2);
         }
         st.d.summary = clip(&summary, SUMMARY_MAX * 3 / 2);
         st.d.summary_upto = old.last().map_or(0, |t| t.n);
@@ -1014,10 +1101,14 @@ impl Memory {
                 out.push(format!("Забываю «{forget}»: из архива удалено реплик — {removed}, досье, конспект и летопись перепишутся в течение минуты."));
                 log::info!("память: хозяин попросил забыть — удалено реплик из архива: {removed}");
             }
-            st.edits.push((forget.into(), remember.into()));
+            if !forget.is_empty() {
+                st.edits.push((forget.into(), remember.into()));
+            }
             self.save(&st);
         }
-        if let Some(rt) = &self.rt {
+        if !forget.is_empty()
+            && let Some(rt) = &self.rt
+        {
             let me = self.clone();
             rt.spawn(async move { me.maintain().await });
         }
@@ -1027,7 +1118,7 @@ impl Memory {
     /// Переписать память по просьбам «забудь/запомни» (моделью; без неё — убрать строки со словами).
     async fn apply_edits(self: &Arc<Self>) {
         let has = self.summarize.lock().unwrap().is_some();
-        let (edits, task, epoch, rev, id, mem, months) = {
+        let (edits, task, epoch, rev, id, mem, months, terms) = {
             let mut st = self.st.lock().unwrap();
             if st.edits.is_empty() || st.compacting {
                 return;
@@ -1052,6 +1143,7 @@ impl Memory {
                         m.text = drop_lines(&m.text, t);
                     }
                 }
+                self.backup();
                 self.save(&st);
                 return;
             }
@@ -1063,7 +1155,7 @@ impl Memory {
                     months.insert(m.month.clone(), m.text.clone());
                 }
             }
-            (edits, task.join("\n"), st.epoch, st.profile_rev, st.d.id.clone(), mem, months)
+            (edits, task.join("\n"), st.epoch, st.profile_rev, st.d.id.clone(), mem, months, terms)
         };
         let out = self.ask(EDIT_INSTRUCTIONS, format!("{task}\n\nПамять:\n{mem}")).await;
         let mut new_months = HashMap::new();
@@ -1091,10 +1183,11 @@ impl Memory {
                 return;
             }
         };
+        self.backup();
         let (profile, summary, ok) = sections(&out);
         if ok {
             if st.profile_rev == rev {
-                st.d.profile = clip(&profile_lines(&profile), PROFILE_MAX * 3 / 2);
+                st.d.profile = merge_profile(&st.d.profile, &profile, &terms, PROFILE_MAX * 3 / 2);
             }
             if st.d.id == id {
                 st.d.summary = clip(&summary, SUMMARY_MAX * 3 / 2);
@@ -1502,5 +1595,79 @@ mod tests {
         assert!(ok && p == "- зовут Павел" && s.starts_with("ДОГОВОРЁННОСТИ:"));
         assert_eq!(profile_lines("Зовут Павел. Любит пиццу."), "- Зовут Павел.\n- Любит пиццу.");
         assert!(!worthy("Яндекс недоступен") && worthy("Готово."));
+    }
+
+    #[tokio::test]
+    async fn compact_preserves_existing_facts_when_llm_drops_them() {
+        let dir = std::env::temp_dir().join(format!("jmem-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = mem(&dir);
+        m.set_profile("- Любит арбуз с солью\n- Старая шутка: ну ты даёшь (хозяин сам попросил запомнить, 21.11)\n- Договорились на фразу ёлки-палки").unwrap();
+        m.add("Привет, включи свет", "Окей");
+        m.add("Ну как там?", "Нормально");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_ref = calls.clone();
+        m.set_summarizer(Some(Arc::new(move |_instr, _text| {
+            calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok("О ХОЗЯИНЕ:\n- Собирает модели самолётов\nДОГОВОРЁННОСТИ:\n- нет\nХРОНОЛОГИЯ:\n- сегодня болтали".into())
+            })
+        })));
+        let n = m.compact_now().await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let prof = m.state()["profile"].as_str().unwrap().to_string();
+        assert!(prof.contains("арбуз с солью"), "{prof}");
+        assert!(prof.contains("ну ты даёшь"), "{prof}");
+        assert!(prof.contains("фразу ёлки-палки"), "{prof}");
+        assert!(prof.contains("Собирает модели самолётов"), "{prof}");
+        assert!(dir.join("chatgpt-chat.bak.json").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remember_only_edit_appends_without_calling_summarizer() {
+        let dir = std::env::temp_dir().join(format!("jmem-rem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = mem(&dir);
+        m.set_profile("- Старая шутка про кота").unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_ref = calls.clone();
+        m.set_summarizer(Some(Arc::new(move |_instr, _text| {
+            calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("О ХОЗЯИНЕ:\n- обрезано\nДОГОВОРЁННОСТИ:\nХРОНОЛОГИЯ:".into()) })
+        })));
+        let res = m.edit("", "говорить доброе утро", &[]);
+        assert!(res.contains("Запомнил"), "{res}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        m.maintain().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let prof = m.state()["profile"].as_str().unwrap().to_string();
+        assert!(prof.contains("Старая шутка про кота"), "{prof}");
+        assert!(prof.contains("говорить доброе утро"), "{prof}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn forget_edit_removes_only_matching_facts_and_preserves_rest() {
+        let dir = std::env::temp_dir().join(format!("jmem-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = mem(&dir);
+        m.set_profile("- Любит арбуз с солью\n- Играет в шахматы с соседом\n- Шутит на фразу ёлки-палки").unwrap();
+        m.set_summarizer(Some(Arc::new(move |_instr, _text| {
+            Box::pin(async {
+                Ok("О ХОЗЯИНЕ:\n- Играет в шахматы с соседом\nДОГОВОРЁННОСТИ:\nХРОНОЛОГИЯ:".into())
+            })
+        })));
+        let _ = m.edit("арбуз", "", &["арбуз".into()]);
+        m.maintain().await;
+        let prof = m.state()["profile"].as_str().unwrap().to_string();
+        assert!(!prof.contains("арбуз"), "{prof}");
+        assert!(prof.contains("шахматы с соседом"), "{prof}");
+        assert!(prof.contains("фразу ёлки-палки"), "{prof}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

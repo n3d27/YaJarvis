@@ -1,13 +1,91 @@
 .updates {
   display: grid;
-  gap: 12px;
-  justify-items: start;
+  gap: 14px;
+  width: 100%;
   min-width: 0;
 }
 
-.actions {
-  gap: 12px;
-  justify-self: stretch;
+.statusCard {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px 16px;
+  flex-wrap: wrap;
+  padding: 16px 18px;
+  border-radius: 16px;
+  background: rgb(0 0 0 / .22);
+  border: 1px solid var(--soft-line);
+}
+
+.versionInfo {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.eyebrow {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--fg3);
+}
+
+.versionRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.version {
+  font: 700 18px/22px var(--mono);
+  color: var(--fg);
+  letter-spacing: -.01em;
+}
+
+.checked {
+  font-size: 12.5px;
+  color: var(--fg3);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.pillAccent {
+  background: var(--acc-soft);
+  color: var(--acc-ink);
+}
+
+.pillOk {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.pillBusy {
+  background: var(--raise);
+  color: var(--fg2);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.toolbar :global(.ic) {
+  width: 15px;
+  height: 15px;
 }
 
 .file {
@@ -33,20 +111,119 @@
   cursor: default;
 }
 
-.release {
-  width: 100%;
-  max-width: 100%;
+.errorBanner {
+  margin: 0;
+  padding: 11px 14px;
+  border-radius: 12px;
+  background: var(--bad-soft);
+  border: 1px solid color-mix(in srgb, var(--bad) 32%, transparent);
+  color: var(--bad);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.releaseCard {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--acc) 11%, rgb(0 0 0 / .24)), rgb(0 0 0 / .24));
+  border: 1px solid color-mix(in srgb, var(--acc) 32%, var(--line));
+}
+
+.releaseHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  flex-wrap: wrap;
+}
+
+.releaseTitle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 220px;
+}
+
+.releaseIcon {
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  background: var(--acc-soft);
+  color: var(--acc-ink);
+}
+
+.releaseIcon :global(.ic) {
+  width: 18px;
+  height: 18px;
+}
+
+.releaseCopy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.releaseCopy b {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--fg);
+}
+
+.releaseCopy small {
+  font-size: 12.5px;
+  color: var(--fg2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.releaseLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--acc-ink);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.releaseLink:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.releaseLink :global(.ic) {
+  width: 12px;
+  height: 12px;
+}
+
+.changelog {
+  display: grid;
+  gap: 8px;
+  padding-top: 14px;
+  border-top: 1px solid color-mix(in srgb, var(--acc) 18%, var(--soft-line));
+}
+
+.changelogLabel {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--fg3);
 }
 
 .notes {
-  max-height: 320px;
-  padding: 12px 14px;
+  max-height: 280px;
   overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--card);
-  color: var(--fg2);
-  font: 400 13px/1.55 var(--sans);
+  scrollbar-width: thin;
+  color: var(--ink2);
+  font: 400 13.5px/1.6 var(--sans);
   overflow-wrap: anywhere;
 }
 
@@ -85,12 +262,12 @@
   margin: 6px 0;
   padding-left: 18px;
   display: grid;
-  gap: 4px;
+  gap: 5px;
 }
 
 .notes :global(li ul),
 .notes :global(li ol) {
-  margin-top: 4px;
+  margin-top: 5px;
 }
 
 .notes :global(strong) {
@@ -143,4 +320,62 @@
   margin: 10px 0;
   border: 0;
   border-top: 1px solid var(--line);
+}
+
+.currentNotes {
+  width: 100%;
+  padding: 12px 16px;
+  border-radius: 14px;
+  background: rgb(0 0 0 / .18);
+  border: 1px solid var(--soft-line);
+}
+
+.prefs {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px;
+  border-radius: 16px;
+  background: rgb(0 0 0 / .2);
+  border: 1px solid var(--soft-line);
+}
+
+.prefRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+}
+
+.prefCopy {
+  display: grid;
+  gap: 3px;
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.prefCopy b {
+  font-size: 14px;
+  color: var(--fg);
+}
+
+.prefCopy small {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--fg2);
+}
+
+.prefDivider {
+  height: 1px;
+  background: var(--soft-line);
+}
+
+.prefSwitch {
+  width: 100%;
+}
+
+@media (max-width: 640px) {
+  .releaseHead > :global(.btn) {
+    width: 100%;
+  }
 }

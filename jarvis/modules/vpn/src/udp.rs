@@ -135,7 +135,7 @@ pub(crate) async fn associate(
                 if !routes.contains_key(&target) {
                     if routes.len() >= 8 { continue; }
                     let Ok(permit) = limit.clone().try_acquire_owned() else { continue; };
-                    let (tx, rx) = mpsc::channel(4);
+                    let (tx, rx) = mpsc::channel(64);
                     routes.insert(target.clone(), tx);
                     let (config, tls, relay, target) = (config.clone(), tls.clone(), relay.clone(), target.clone());
                     let pre = predial.take();

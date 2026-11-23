@@ -47,7 +47,6 @@ struct St {
     last_loud: Option<Instant>,
     pending_wake: bool,
     echo: EchoWindow,
-    wake_echo: Option<wake_reply::WakeEcho>,
     input_at: Option<Instant>,
 }
 
@@ -189,9 +188,11 @@ fn short(e: &str) -> String {
     if e.chars().count() > 160 { format!("{}…", e.chars().take(160).collect::<String>()) } else { e.into() }
 }
 
-fn command_settled(schedule: fastcmd::AliceSchedule, since: Duration, quiet_for: Duration) -> bool {
+fn command_settled(schedule: fastcmd::AliceSchedule, is_stop: bool, since: Duration, quiet_for: Duration) -> bool {
     match schedule {
-        fastcmd::AliceSchedule::None => since >= Duration::from_millis(350),
+        fastcmd::AliceSchedule::None if is_stop => since >= Duration::from_millis(350),
+        fastcmd::AliceSchedule::None => since >= Duration::from_millis(450)
+            && (quiet_for >= Duration::from_millis(450) || since >= Duration::from_millis(1600)),
         fastcmd::AliceSchedule::Ready => since >= Duration::from_millis(750)
             && (quiet_for >= Duration::from_millis(550) || since >= Duration::from_millis(2200)),
         fastcmd::AliceSchedule::Pending => since >= Duration::from_millis(2200)
@@ -398,15 +399,9 @@ impl Engine {
                         if st.holding && st.live.is_none() && st.hold.len() < 20 * RATE {
                             st.hold.extend_from_slice(&raw);
                         }
-                        let now = Instant::now();
-                        if st.wake_echo.as_ref().is_some_and(|echo| echo.expired(now)) {
-                            st.wake_echo = None;
-                        }
-                        let input = st.wake_echo.as_ref().map_or_else(
-                            || std::borrow::Cow::Borrowed(raw.as_ref()),
-                            |echo| echo.filter(&raw, now),
-                        );
-                        (st.live.clone(), st.busy, st.echo.muted(now), input)
+                        // Эхо своего голоса уже вычел Yandex VQE: его опорный сигнал — петля с выхода
+                        // на динамик (hw:0,0), куда идёт и наш aplay. Микрофон приходит уже чистым.
+                        (st.live.clone(), st.busy, st.echo.muted(Instant::now()), raw.clone())
                     };
                     let boost_db = e.store.mic_boost_db();
                     if !muted_input && activity.observe(&input, busy, boost_db) {
@@ -589,7 +584,6 @@ impl Engine {
             }
             st.busy = true;
             st.echo = EchoWindow::default();
-            st.wake_echo = None;
             st.last_wake = Some(Instant::now());
             st.aborted = false;
             st.hold.clear();
@@ -633,7 +627,6 @@ impl Engine {
                             st.hold.clear();
                             st.holding = false;
                             st.echo = EchoWindow::default();
-                            st.wake_echo = None;
                             self.engine.music.talk_ended(&self.engine.rt);
                             self.engine.reset_wake.store(true, Ordering::Relaxed);
                             self.engine.leds.set(Mode::Off);
@@ -654,7 +647,6 @@ impl Engine {
                     st.hold.clear();
                     st.holding = false;
                     st.echo = EchoWindow::default();
-                    st.wake_echo = None;
                     q
                 };
                 e.reset_wake.store(true, Ordering::Relaxed);
@@ -860,9 +852,11 @@ impl Engine {
                 let reply = reply.filter(|_| !st.aborted && st.input_at.is_none_or(|at| at < opening_at));
                 // The wake word has already been detected. Avoid replaying seconds of
                 // old audio into the subscription call before the first real question.
-                let before = if matches!(p.engine.as_str(), "chatgpt" | "gemini") {
-                    preroll.len().saturating_sub(RATE * 4 / 5)
-                } else { 0 };
+                let before = match p.engine.as_str() {
+                    "chatgpt" => preroll.len().saturating_sub(RATE / 4),
+                    "gemini" => preroll.len().saturating_sub(RATE * 4 / 5),
+                    _ => 0,
+                };
                 if reply.is_none() {
                     let mut first = preroll[before..].to_vec();
                     first.extend_from_slice(&st.hold);
@@ -985,10 +979,11 @@ impl Engine {
             let (id, text, since) = x.dialog().utterance();
             if id != 0 && (id != checked || text != checked_text) && !x.handles_commands() {
                 let command = fastcmd::command_for_phrase(&text, &self.listener.phrase());
+                let is_stop = fastcmd::is_stop(&command);
                 let question = fastcmd::clarification(&command);
                 let schedule = if question.is_some() { fastcmd::AliceSchedule::Pending } else { fastcmd::alice_schedule(&command) };
                 let quiet_for = self.st.lock().unwrap().last_loud.map(|time| time.elapsed()).unwrap_or(Duration::MAX);
-                if command_settled(schedule, since, quiet_for) {
+                if command_settled(schedule, is_stop, since, quiet_for) {
                     checked = id;
                     checked_text.clone_from(&text);
                     if let Some(question) = question {
@@ -1033,7 +1028,10 @@ impl Engine {
             note("стоп", "");
             return true;
         }
-        if fastcmd::youtube_request(&cmd) {
+        if fastcmd::youtube_request(&cmd)
+            || (crate::music::parse_play_intent(&cmd).is_some()
+                && self.host.provider("youtube").is_ok())
+        {
             return false;
         }
         let rt = &self.rt;
@@ -1319,13 +1317,18 @@ impl Engine {
 mod tests {
     #[test]
     fn waits_for_the_duration_after_a_transcript_pause() {
-        use super::{Duration, command_settled, fastcmd::AliceSchedule::{Pending, Ready}};
+        use super::{Duration, command_settled, fastcmd::AliceSchedule::{None as SchedNone, Pending, Ready}};
         let pause = Duration::from_millis;
-        assert!(!command_settled(Pending, pause(400), pause(400)));
-        assert!(!command_settled(Pending, pause(1800), pause(1100)));
-        assert!(!command_settled(Ready, pause(750), pause(100)));
-        assert!(command_settled(Ready, pause(800), pause(650)));
-        assert!(command_settled(Pending, pause(2300), pause(800)));
+        assert!(command_settled(SchedNone, true, pause(350), pause(0)));
+        assert!(!command_settled(SchedNone, false, pause(400), pause(400)));
+        assert!(!command_settled(SchedNone, false, pause(500), pause(100)));
+        assert!(command_settled(SchedNone, false, pause(500), pause(500)));
+        assert!(command_settled(SchedNone, false, pause(1650), pause(100)));
+        assert!(!command_settled(Pending, false, pause(400), pause(400)));
+        assert!(!command_settled(Pending, false, pause(1800), pause(1100)));
+        assert!(!command_settled(Ready, false, pause(750), pause(100)));
+        assert!(command_settled(Ready, false, pause(800), pause(650)));
+        assert!(command_settled(Pending, false, pause(2300), pause(800)));
     }
 
     #[test]

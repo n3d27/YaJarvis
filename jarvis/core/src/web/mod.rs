@@ -171,6 +171,8 @@ pub fn router(app: App) -> Router {
         .route("/api/music", get(music::get).post(music::post))
         .route("/api/youtube", put(music::set_cookies).delete(music::clear_cookies))
         .route("/api/youtube/login", post(music::youtube_login).delete(music::youtube_logout))
+        .route("/api/youtube/library", get(music::youtube_library))
+        .route("/api/youtube/playlist/{id}", get(music::youtube_playlist))
         .route("/api/vless", put(vpn::put))
         .route("/api/test/net", post(vpn::test_net))
         .route("/api/memory", get(memory::get).put(memory::put))
@@ -231,7 +233,7 @@ async fn guard(State(app): State<App>, ConnectInfo(peer): ConnectInfo<SocketAddr
     let set = |h: &mut axum::http::HeaderMap, k: &'static str, v: &'static str| {
         h.insert(k, HeaderValue::from_static(v));
     };
-    set(h, "content-security-policy", "default-src 'self'; img-src 'self' data: https://i.ytimg.com https://avatars.yandex.net https://i.scdn.co; media-src 'self' blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    set(h, "content-security-policy", "default-src 'self'; img-src 'self' data: https://i.ytimg.com https://i9.ytimg.com https://yt3.ggpht.com https://lh3.googleusercontent.com https://*.ytimg.com https://*.ggpht.com https://*.googleusercontent.com https://avatars.yandex.net https://i.scdn.co; media-src 'self' blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     set(h, "x-frame-options", "DENY");
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");

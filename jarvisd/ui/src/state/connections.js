@@ -33,6 +33,12 @@ export function connDefs() {
   const chatgpt = S.chatgpt;
   const youtube = S.youtube || {};
   const account = youtube.account || {};
+  const ytLabel = [
+    account.name && account.name !== "Аккаунт Google" ? account.name : "",
+    account.handle || account.email || "",
+  ]
+    .filter((v, i, arr) => v && arr.indexOf(v) === i)
+    .join(" · ");
   const key = (id, options) => ({
     id, plugin: "", group: "voice", ...options, keyField: true,
     on: Boolean(keys[id]), need: !keys[id] && !options.optional,
@@ -65,7 +71,7 @@ export function connDefs() {
     { id: "youtube", group: "media", plugin: "youtube", mono: "YT", name: "YouTube", about: "Музыка и видео голосом. Вход — для ваших рекомендаций и видео 18+",
       more: "Там, где YouTube заблокирован (Россия), включите «Через VPN»",
       on: Boolean(account.signed_in || youtube.set), wait: !account.signed_in && Boolean(account.code),
-      state: account.signed_in ? "вход выполнен" : youtube.set ? "куки загружены" : account.code ? "ждёт код" : "не подключено" },
+      state: account.signed_in ? (ytLabel || "вход выполнен") : youtube.set ? (ytLabel ? `${ytLabel} · куки` : "куки загружены") : account.code ? "ждёт код" : "не подключено" },
     { id: "vpn", group: "system", plugin: "vpn", icon: "shield", name: "VPN для Джарвиса",
       about: "Через VPN идёт только сам Джарвис, Алиса — всегда напрямую. Что именно пускать через VPN — галочки ниже",
       on: Boolean(vpn.set) && !vpn.error, bad: Boolean(vpn.error), need: !vpn.set,

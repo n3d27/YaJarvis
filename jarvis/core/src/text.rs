@@ -22,6 +22,7 @@ impl Engine {
             if let Some(question)=fastcmd::clarification(command){return Ok(question.into());}
             if let Some(answer)=self.host.command(command).await{return Ok(answer);}
             if let Some(answer)=self.music.control(&self.host,command).await{return Ok(answer);}
+            if let Some(answer)=self.music.play_intent(&self.host,command).await{return Ok(answer);}
             if let Some(answer)=self.tools.ha_vacuum(command).await{return Ok(answer);}
             if let Some(answer)=self.tools.smartlife_fast(command).await{return Ok(answer);}
             if let Some(command)=fastcmd::alice_skill_for(command,s.use_home("yandexmusic")){

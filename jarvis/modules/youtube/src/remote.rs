@@ -13,6 +13,7 @@ pub const WEB_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 pub const WEB_VERSION: &str = "2.20261112.01.00";
 pub const TV_AGENT: &str = "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1";
 const TV_VERSION: &str = "4.20240101";
+const TV_BROWSE_VERSION: &str = "7.20260114.12.00";
 const VR_VERSION: &str = "1.65.10";
 const VR_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 
@@ -33,6 +34,74 @@ impl Track {
         }
     }
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Playlist {
+    #[serde(rename = "ID", alias = "id", default)]
+    pub id: String,
+    #[serde(rename = "Title", alias = "title", default)]
+    pub title: String,
+    #[serde(
+        rename = "Count",
+        alias = "count",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub count: String,
+    #[serde(
+        rename = "Thumb",
+        alias = "thumb",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub thumb: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccountProfile {
+    pub name: String,
+    pub handle: String,
+    pub email: String,
+}
+
+impl AccountProfile {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty() && self.handle.is_empty() && self.email.is_empty()
+    }
+
+    pub fn merge_missing(&mut self, other: AccountProfile) {
+        if self.name.is_empty() {
+            self.name = other.name;
+        }
+        if self.handle.is_empty() {
+            self.handle = other.handle;
+        }
+        if self.email.is_empty() {
+            self.email = other.email;
+        }
+        self.normalize();
+    }
+
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        self.handle = self.handle.trim().to_string();
+        self.email = self.email.trim().to_string();
+        if self.handle.contains('@') && !self.handle.starts_with('@') {
+            if self.email.is_empty() {
+                self.email = std::mem::take(&mut self.handle);
+            } else {
+                self.handle.clear();
+            }
+        }
+        if self.email.starts_with('@') {
+            if self.handle.is_empty() {
+                self.handle = std::mem::take(&mut self.email);
+            } else {
+                self.email.clear();
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Stream {
     pub url: Url,
@@ -90,30 +159,367 @@ impl Remote {
         }
         Ok(vec![])
     }
-    pub async fn recommendations(&self, mut headers: HeaderMap) -> Result<Vec<Track>, String> {
+    pub async fn recommendations(&self, headers: HeaderMap) -> Result<Vec<Track>, String> {
         if headers.is_empty() {
             return Ok(Vec::new());
         }
-        let version = "7.20260114.12.00";
-        headers.insert(
-            "X-YouTube-Client-Name",
-            reqwest::header::HeaderValue::from_static("7"),
-        );
-        headers.insert(
-            "X-YouTube-Client-Version",
-            reqwest::header::HeaderValue::from_static(version),
-        );
-        let response = post(&self.host.client().await?, "browse", TV_AGENT, &json!({
-            "context":{"client":{"clientName":"TVHTML5","clientVersion":version,"hl":"ru","gl":"RU",
-                "platform":"TV","deviceMake":"Samsung","deviceModel":"SmartTV"}},
-            "browseId":"FEwhat_to_watch"
-        }), headers).await?;
-        if response["responseContext"]["mainAppWebResponseContext"]["loggedOut"] == true {
-            return Err("YouTube просит войти заново".into());
-        }
+        let response = self
+            .browse_request(json!({"browseId": "FEwhat_to_watch"}), headers)
+            .await?;
         let mut tracks = Vec::new();
         organic(&response["contents"], &mut tracks, &mut HashSet::new(), 0);
         Ok(tracks)
+    }
+
+    async fn post_client(
+        &self,
+        path: &str,
+        mut body: Value,
+        mut headers: HeaderMap,
+    ) -> Result<Value, String> {
+        let client = self.host.client().await?;
+        if has_bearer(&headers) {
+            headers.insert(
+                "X-YouTube-Client-Name",
+                reqwest::header::HeaderValue::from_static("7"),
+            );
+            headers.insert(
+                "X-YouTube-Client-Version",
+                reqwest::header::HeaderValue::from_static(TV_BROWSE_VERSION),
+            );
+            headers.insert(
+                "Origin",
+                reqwest::header::HeaderValue::from_static("https://www.youtube.com"),
+            );
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "context".into(),
+                    json!({"client": {"clientName": "TVHTML5", "clientVersion": TV_BROWSE_VERSION, "hl": "ru", "gl": "RU", "platform": "TV", "deviceMake": "Samsung", "deviceModel": "SmartTV"}}),
+                );
+            }
+            post(&client, path, TV_AGENT, &body, headers).await
+        } else {
+            strip_bearer(&mut headers);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("context".into(), json!({"client": web()}));
+            }
+            post(&client, path, WEB_AGENT, &body, headers).await
+        }
+    }
+
+    pub async fn browse_request(
+        &self,
+        body: Value,
+        headers: HeaderMap,
+    ) -> Result<Value, String> {
+        let authed = !headers.is_empty();
+        let data = self.post_client("browse", body, headers).await.map_err(|e| {
+            if authed && (e.contains("401") || e.contains("403")) {
+                "YouTube просит войти заново".into()
+            } else {
+                e
+            }
+        })?;
+        if authed && data["responseContext"]["mainAppWebResponseContext"]["loggedOut"] == true {
+            return Err("YouTube просит войти заново".into());
+        }
+        Ok(data)
+    }
+
+    pub async fn account_profile(&self, headers: HeaderMap) -> Result<AccountProfile, String> {
+        if headers.is_empty() {
+            return Ok(AccountProfile::default());
+        }
+        let mut profile = AccountProfile::default();
+        for endpoint in ["account/account_menu", "account/accounts_list"] {
+            if let Ok(data) = self.post_client(endpoint, json!({}), headers.clone()).await {
+                profile.merge_missing(parse_account_profile(&data));
+            }
+            if !profile.name.is_empty() && (!profile.handle.is_empty() || !profile.email.is_empty())
+            {
+                break;
+            }
+        }
+        if has_bearer(&headers)
+            && (profile.name.is_empty() || profile.handle.is_empty())
+            && let Ok(data) = self
+                .data_api_get(
+                    "channels",
+                    &[("part", "snippet"), ("mine", "true")],
+                    &headers,
+                )
+                .await
+        {
+            let snippet = &data["items"][0]["snippet"];
+            profile.merge_missing(AccountProfile {
+                name: snippet["title"].as_str().unwrap_or("").to_string(),
+                handle: snippet["customUrl"].as_str().unwrap_or("").to_string(),
+                email: String::new(),
+            });
+        }
+        profile.normalize();
+        Ok(profile)
+    }
+
+    async fn data_api_get(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        headers: &HeaderMap,
+    ) -> Result<Value, String> {
+        let Some(auth) = bearer_headers(headers) else {
+            return Err("Нет токена YouTube".into());
+        };
+        let response = self
+            .host
+            .client()
+            .await?
+            .get(format!("https://www.googleapis.com/youtube/v3/{path}"))
+            .query(query)
+            .headers(auth)
+            .send()
+            .await
+            .map_err(|_| "Нет соединения с Google")?;
+        if matches!(response.status().as_u16(), 401) {
+            return Err("YouTube просит войти заново".into());
+        }
+        response_json(response).await
+    }
+
+    async fn data_api_playlists(&self, headers: &HeaderMap) -> Result<Vec<Playlist>, String> {
+        let data = self
+            .data_api_get(
+                "playlists",
+                &[
+                    ("part", "snippet,contentDetails"),
+                    ("mine", "true"),
+                    ("maxResults", "50"),
+                ],
+                headers,
+            )
+            .await?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for item in data["items"].as_array().into_iter().flatten() {
+            let id = item["id"].as_str().unwrap_or("");
+            let title = item["snippet"]["title"].as_str().unwrap_or("").trim().to_string();
+            if !valid_playlist_id(id) || id.starts_with("RD") || title.is_empty() {
+                continue;
+            }
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            let count = item["contentDetails"]["itemCount"]
+                .as_u64()
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let thumb = ["medium", "high", "default"]
+                .into_iter()
+                .filter_map(|k| item["snippet"]["thumbnails"][k]["url"].as_str())
+                .map(safe_thumb)
+                .find(|s| !s.is_empty())
+                .unwrap_or_default();
+            out.push(Playlist {
+                id: id.to_string(),
+                title,
+                count,
+                thumb,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn data_api_playlist_items(
+        &self,
+        playlist_id: &str,
+        headers: &HeaderMap,
+        limit: usize,
+    ) -> Result<Vec<Track>, String> {
+        let max_s = limit.min(50).to_string();
+        let data = self
+            .data_api_get(
+                "playlistItems",
+                &[
+                    ("part", "snippet"),
+                    ("playlistId", playlist_id),
+                    ("maxResults", &max_s),
+                ],
+                headers,
+            )
+            .await?;
+        Ok(parse_data_api_tracks(&data["items"], false, limit))
+    }
+
+    async fn data_api_liked(
+        &self,
+        headers: &HeaderMap,
+        limit: usize,
+    ) -> Result<Vec<Track>, String> {
+        let max_s = limit.min(50).to_string();
+        let data = self
+            .data_api_get(
+                "videos",
+                &[
+                    ("part", "snippet"),
+                    ("myRating", "like"),
+                    ("maxResults", &max_s),
+                ],
+                headers,
+            )
+            .await?;
+        Ok(parse_data_api_tracks(&data["items"], true, limit))
+    }
+
+    pub async fn playlists(&self, headers: HeaderMap) -> Result<Vec<Playlist>, String> {
+        if headers.is_empty() {
+            return Err("Войдите в аккаунт YouTube в настройках".into());
+        }
+        let bearer = has_bearer(&headers);
+        let browse_ids = if bearer {
+            ["FElibrary", "FEplaylist_aggregation"]
+        } else {
+            ["FEplaylist_aggregation", "FElibrary"]
+        };
+        let mut last_err: Option<String> = None;
+        for bid in browse_ids {
+            match self
+                .browse_request(json!({"browseId": bid}), headers.clone())
+                .await
+            {
+                Ok(page) => {
+                    let list = parse_playlists(&page);
+                    if !list.is_empty() {
+                        return Ok(list);
+                    }
+                }
+                Err(e) if e.contains("войти заново") => return Err(e),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if bearer {
+            match self.data_api_playlists(&headers).await {
+                Ok(list) if !list.is_empty() => return Ok(list),
+                Ok(_) => return Ok(Vec::new()),
+                Err(e) if e.contains("войти заново") => return Err(e),
+                Err(e) => {
+                    if let Some(browse_err) = last_err {
+                        return Err(browse_err);
+                    }
+                    let _ = e;
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(Vec::new())
+    }
+
+    pub async fn playlist_tracks(
+        &self,
+        playlist_id: &str,
+        headers: HeaderMap,
+        max_tracks: usize,
+    ) -> Result<Vec<Track>, String> {
+        if !valid_playlist_id(playlist_id) {
+            return Err("Неверный ID плейлиста YouTube".into());
+        }
+        let limit = max_tracks.clamp(1, 100);
+        let bearer = has_bearer(&headers);
+        let mut tracks = Vec::new();
+        let mut seen = HashSet::new();
+        let mut visited_tokens = HashSet::new();
+        let mut body = json!({"browseId": format!("VL{playlist_id}")});
+        let mut first_err: Option<String> = None;
+        for page_idx in 0..3 {
+            match self.browse_request(body, headers.clone()).await {
+                Ok(page) => {
+                    let content = browse_contents(&page);
+                    organic_limit(content, &mut tracks, &mut seen, 0, limit);
+                    if tracks.len() >= limit {
+                        break;
+                    }
+                    let Some(token) = continuation_token(content) else {
+                        break;
+                    };
+                    if !visited_tokens.insert(token.clone()) {
+                        break;
+                    }
+                    body = json!({"continuation": token});
+                }
+                Err(e) if e.contains("войти заново") => return Err(e),
+                Err(e) => {
+                    if page_idx == 0 {
+                        first_err = Some(e);
+                    }
+                    break;
+                }
+            }
+        }
+        if tracks.is_empty() && bearer && !matches!(playlist_id, "LM" | "LL") {
+            match self.data_api_playlist_items(playlist_id, &headers, limit).await {
+                Ok(api_tracks) if !api_tracks.is_empty() => return Ok(api_tracks),
+                Ok(_) if first_err.is_none() => return Ok(Vec::new()),
+                Err(e) if e.contains("войти заново") => return Err(e),
+                _ => {}
+            }
+        }
+        if tracks.is_empty()
+            && let Some(err) = first_err
+        {
+            return Err(err);
+        }
+        Ok(tracks)
+    }
+
+    pub async fn liked_tracks(
+        &self,
+        headers: HeaderMap,
+        max_tracks: usize,
+    ) -> Result<Vec<Track>, String> {
+        if headers.is_empty() {
+            return Err("Войдите в аккаунт YouTube в настройках".into());
+        }
+        let bearer = has_bearer(&headers);
+        let mut last_err: Option<String> = None;
+        for id in ["LM", "LL"] {
+            match self.playlist_tracks(id, headers.clone(), max_tracks).await {
+                Ok(tracks) if !tracks.is_empty() => return Ok(tracks),
+                Ok(_) => {}
+                Err(e) if e.contains("войти заново") => return Err(e),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if bearer {
+            match self.data_api_liked(&headers, max_tracks).await {
+                Ok(tracks) => return Ok(tracks),
+                Err(e) if e.contains("войти заново") => return Err(e),
+                Err(e) => last_err = last_err.or(Some(e)),
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(Vec::new())
+    }
+
+    pub async fn search_playlists(
+        &self,
+        query: &str,
+        mut headers: HeaderMap,
+    ) -> Result<Vec<Playlist>, String> {
+        strip_bearer(&mut headers);
+        let body = json!({
+            "context": {"client": web()},
+            "query": query,
+            "params": "EgIQAw=="
+        });
+        let client = self.host.client().await?;
+        let data = post(&client, "search", WEB_AGENT, &body, headers).await?;
+        self.note_visitor(&data);
+        let section = &data["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]
+            ["sectionListRenderer"]["contents"];
+        Ok(parse_playlists(section))
     }
     pub async fn related(&self, id: &str, mut headers: HeaderMap) -> Result<Vec<Track>, String> {
         strip_bearer(&mut headers);
@@ -234,12 +640,23 @@ async fn vr(client: &Client, id: &str, visitor: &str) -> Result<(Track, Stream),
 fn web() -> Value {
     json!({"clientName":"WEB","clientVersion":WEB_VERSION,"hl":"ru","gl":"RU"})
 }
-fn strip_bearer(headers: &mut HeaderMap) {
-    if headers
+fn has_bearer(headers: &HeaderMap) -> bool {
+    headers
         .get(reqwest::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("Bearer "))
-    {
+}
+fn bearer_headers(headers: &HeaderMap) -> Option<HeaderMap> {
+    let value = headers.get(reqwest::header::AUTHORIZATION)?;
+    if !value.to_str().ok().is_some_and(|v| v.starts_with("Bearer ")) {
+        return None;
+    }
+    let mut out = HeaderMap::new();
+    out.insert(reqwest::header::AUTHORIZATION, value.clone());
+    Some(out)
+}
+fn strip_bearer(headers: &mut HeaderMap) {
+    if has_bearer(headers) {
         headers.remove(reqwest::header::AUTHORIZATION);
     }
 }
@@ -275,20 +692,222 @@ fn label(v: &Value) -> String {
         .take(300)
         .collect()
 }
+pub fn safe_thumb(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return String::new();
+    }
+    let Ok(url) = Url::parse(trimmed) else {
+        return String::new();
+    };
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return String::new();
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return String::new();
+    };
+    if matches!(
+        host.as_str(),
+        "i.ytimg.com" | "i9.ytimg.com" | "yt3.ggpht.com" | "lh3.googleusercontent.com"
+    ) || host.ends_with(".ytimg.com")
+        || host.ends_with(".ggpht.com")
+        || host.ends_with(".googleusercontent.com")
+    {
+        trimmed.to_string()
+    } else {
+        String::new()
+    }
+}
+fn collect_thumb_candidates(value: &Value, out: &mut Vec<(String, i64)>, depth: u8) {
+    if depth > 10 {
+        return;
+    }
+    match value {
+        Value::Array(list) => {
+            for item in list {
+                collect_thumb_candidates(item, out, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(url) = map.get("url").and_then(Value::as_str) {
+                let clean = safe_thumb(url);
+                if !clean.is_empty() {
+                    let width = map.get("width").and_then(Value::as_i64).unwrap_or(0);
+                    out.push((clean, width));
+                }
+            }
+            for key in [
+                "thumbnail",
+                "thumbnails",
+                "thumbnailRenderer",
+                "playlistVideoThumbnailRenderer",
+                "playlistCustomThumbnailRenderer",
+                "header",
+                "tileHeaderRenderer",
+                "contentImage",
+                "collectionThumbnailViewModel",
+                "primaryThumbnail",
+                "thumbnailViewModel",
+                "image",
+                "sources",
+            ] {
+                if let Some(child) = map.get(key) {
+                    collect_thumb_candidates(child, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+fn thumb_url(item: &Value) -> String {
+    let mut candidates = Vec::new();
+    collect_thumb_candidates(item, &mut candidates, 0);
+    candidates
+        .into_iter()
+        .min_by_key(|(_, width)| {
+            if *width <= 0 {
+                10_000
+            } else {
+                (*width - 360).abs()
+            }
+        })
+        .map(|(url, _)| url)
+        .unwrap_or_default()
+}
+fn parse_data_api_tracks(items: &Value, direct_video: bool, limit: usize) -> Vec<Track> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items.as_array().into_iter().flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let id = if direct_video {
+            item["id"].as_str()
+        } else {
+            item["snippet"]["resourceId"]["videoId"].as_str()
+        };
+        let Some(id) = id.filter(|s| valid_id(s)) else {
+            continue;
+        };
+        let title = item["snippet"]["title"].as_str().unwrap_or("").trim();
+        if title.is_empty() || matches!(title, "Deleted video" | "Private video") {
+            continue;
+        }
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        let author = item["snippet"]["videoOwnerChannelTitle"]
+            .as_str()
+            .or_else(|| item["snippet"]["channelTitle"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.push(Track {
+            id: id.to_string(),
+            title: title.chars().take(300).collect(),
+            author: author.chars().take(300).collect(),
+        });
+    }
+    out
+}
+pub(crate) fn browse_contents<'a>(root: &'a Value) -> &'a Value {
+    fn find_shelf<'a>(value: &'a Value, depth: u8) -> Option<&'a Value> {
+        if depth > 14 {
+            return None;
+        }
+        match value {
+            Value::Object(map) => {
+                for key in [
+                    "playlistVideoListRenderer",
+                    "playlistVideoListContinuation",
+                    "musicPlaylistShelfRenderer",
+                    "musicPlaylistShelfContinuation",
+                ] {
+                    if let Some(hit) = map.get(key)
+                        && hit.is_object()
+                    {
+                        return Some(hit);
+                    }
+                }
+                for child in map.values() {
+                    if let Some(hit) = find_shelf(child, depth + 1) {
+                        return Some(hit);
+                    }
+                }
+                None
+            }
+            Value::Array(items) => items.iter().find_map(|item| find_shelf(item, depth + 1)),
+            _ => None,
+        }
+    }
+    find_shelf(root, 0).unwrap_or(root)
+}
+pub(crate) fn continuation_token(root: &Value) -> Option<String> {
+    fn walk(value: &Value, depth: u8) -> Option<String> {
+        if depth > 14 {
+            return None;
+        }
+        match value {
+            Value::Object(map) => {
+                if let Some(token) = value["continuationItemRenderer"]["continuationEndpoint"]
+                    ["continuationCommand"]["token"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                {
+                    return Some(token.to_string());
+                }
+                for kind in ["nextContinuationData", "reloadContinuationData"] {
+                    if let Some(token) = value[kind]["continuation"]
+                        .as_str()
+                        .filter(|t| !t.is_empty())
+                    {
+                        return Some(token.to_string());
+                    }
+                }
+                for (key, child) in map {
+                    if matches!(key.as_str(), "menu" | "navigationEndpoint" | "header") {
+                        continue;
+                    }
+                    if let Some(token) = walk(child, depth + 1) {
+                        return Some(token);
+                    }
+                }
+                None
+            }
+            Value::Array(items) => items.iter().find_map(|item| walk(item, depth + 1)),
+            _ => None,
+        }
+    }
+    walk(root, 0)
+}
 fn organic(value: &Value, out: &mut Vec<Track>, seen: &mut HashSet<String>, depth: u8) {
-    if out.len() >= 30 || depth >= 16 {
+    organic_limit(value, out, seen, depth, 30);
+}
+pub(crate) fn organic_limit(
+    value: &Value,
+    out: &mut Vec<Track>,
+    seen: &mut HashSet<String>,
+    depth: u8,
+    limit: usize,
+) {
+    if out.len() >= limit || depth >= 16 {
         return;
     }
     match value {
         Value::Array(list) => {
             for v in list {
-                organic(v, out, seen, depth + 1);
+                organic_limit(v, out, seen, depth + 1, limit);
             }
         }
         Value::Object(_) => {
             for name in [
                 "videoRenderer",
                 "compactVideoRenderer",
+                "playlistVideoRenderer",
                 "playlistPanelVideoRenderer",
                 "gridVideoRenderer",
                 "tileRenderer",
@@ -303,7 +922,12 @@ fn organic(value: &Value, out: &mut Vec<Track>, seen: &mut HashSet<String>, dept
                             &item["metadata"]["lockupMetadataViewModel"]["title"]["content"];
                         identified(item["contentId"].as_str(), label(title), String::new())
                     }
-                    "tileRenderer" if find(item, "adBadgeViewModel", 0).is_none() => {
+                    "tileRenderer"
+                        if matches!(
+                            item["contentType"].as_str(),
+                            None | Some("") | Some("TILE_CONTENT_TYPE_VIDEO")
+                        ) && find(item, "adBadgeViewModel", 0).is_none() =>
+                    {
                         let id = find(item, "watchEndpoint", 0)
                             .and_then(|node| node["videoId"].as_str());
                         let title = find(item, "tileMetadataRenderer", 0)
@@ -316,7 +940,7 @@ fn organic(value: &Value, out: &mut Vec<Track>, seen: &mut HashSet<String>, dept
                     }
                     "lockupViewModel" | "tileRenderer" => None,
                     _ => {
-                        let author = ["ownerText", "longBylineText", "shortBylineText"]
+                        let author = ["shortBylineText", "ownerText", "longBylineText"]
                             .into_iter()
                             .map(|k| label(&item[k]))
                             .find(|s| !s.is_empty())
@@ -334,7 +958,11 @@ fn organic(value: &Value, out: &mut Vec<Track>, seen: &mut HashSet<String>, dept
             for name in [
                 "contents",
                 "itemSectionRenderer",
+                "sectionListRenderer",
+                "playlistVideoListRenderer",
+                "playlistVideoListContinuation",
                 "shelfRenderer",
+                "tvShelfRenderer",
                 "content",
                 "verticalListRenderer",
                 "items",
@@ -349,16 +977,233 @@ fn organic(value: &Value, out: &mut Vec<Track>, seen: &mut HashSet<String>, dept
                 "richGridRenderer",
                 "richShelfRenderer",
                 "twoColumnBrowseResultsRenderer",
+                "onResponseReceivedActions",
+                "appendContinuationItemsAction",
+                "continuationItems",
                 "tabs",
                 "tabRenderer",
             ] {
                 if let Some(child) = value.get(name) {
-                    organic(child, out, seen, depth + 1);
+                    organic_limit(child, out, seen, depth + 1, limit);
                 }
             }
         }
         _ => {}
     }
+}
+fn text_label(v: &Value) -> String {
+    let s = label(v);
+    if !s.is_empty() {
+        return s;
+    }
+    label(&v["content"])
+}
+
+pub(crate) fn parse_account_profile(value: &Value) -> AccountProfile {
+    fn walk(
+        value: &Value,
+        depth: u8,
+        header: &mut AccountProfile,
+        selected_item: &mut AccountProfile,
+        fallback_item: &mut AccountProfile,
+    ) {
+        if depth > 16 {
+            return;
+        }
+        match value {
+            Value::Array(list) => {
+                for item in list {
+                    walk(item, depth + 1, header, selected_item, fallback_item);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(hdr) = map.get("activeAccountHeaderRenderer") {
+                    header.merge_missing(AccountProfile {
+                        name: text_label(&hdr["accountName"]),
+                        handle: text_label(&hdr["channelHandle"]),
+                        email: text_label(&hdr["email"]),
+                    });
+                }
+                if let Some(item) = map.get("accountItemRenderer") {
+                    let byline = text_label(&item["accountByline"]);
+                    let (handle, email) = if byline.starts_with('@') {
+                        (byline, String::new())
+                    } else if byline.contains('@') {
+                        (String::new(), byline)
+                    } else {
+                        (String::new(), String::new())
+                    };
+                    let mut candidate = AccountProfile {
+                        name: text_label(&item["accountName"]),
+                        handle,
+                        email,
+                    };
+                    candidate.normalize();
+                    if item["isSelected"] == true {
+                        selected_item.merge_missing(candidate);
+                    } else {
+                        fallback_item.merge_missing(candidate);
+                    }
+                }
+                for child in map.values() {
+                    walk(child, depth + 1, header, selected_item, fallback_item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut header = AccountProfile::default();
+    let mut selected_item = AccountProfile::default();
+    let mut fallback_item = AccountProfile::default();
+    walk(
+        value,
+        0,
+        &mut header,
+        &mut selected_item,
+        &mut fallback_item,
+    );
+    header.merge_missing(selected_item);
+    if header.name.is_empty() {
+        header.merge_missing(fallback_item);
+    }
+    header.normalize();
+    header
+}
+
+pub(crate) fn parse_playlists(value: &Value) -> Vec<Playlist> {
+    fn walk(
+        value: &Value,
+        out: &mut Vec<Playlist>,
+        seen: &mut HashSet<String>,
+        depth: u8,
+    ) {
+        if out.len() >= 100 || depth >= 16 {
+            return;
+        }
+        match value {
+            Value::Array(list) => {
+                for item in list {
+                    walk(item, out, seen, depth + 1);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(tile) = map.get("tileRenderer") {
+                    if tile["contentType"] == "TILE_CONTENT_TYPE_PLAYLIST" {
+                        let id = tile["onSelectCommand"]["watchEndpoint"]["playlistId"]
+                            .as_str()
+                            .or_else(|| {
+                                tile["onSelectCommand"]["browseEndpoint"]["browseId"]
+                                    .as_str()
+                                    .map(|s| s.strip_prefix("VL").unwrap_or(s))
+                            })
+                            .unwrap_or("");
+                        let title = label(&tile["metadata"]["tileMetadataRenderer"]["title"]);
+                        let lines0 = &tile["metadata"]["tileMetadataRenderer"]["lines"][0];
+                        let count = find(lines0, "lineItemRenderer", 0)
+                            .map(|n| label(&n["text"]))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| label(lines0));
+                        push_playlist(id, title, count, thumb_url(tile), out, seen);
+                    }
+                    return;
+                }
+                for key in ["gridPlaylistRenderer", "playlistRenderer", "compactPlaylistRenderer"] {
+                    if let Some(item) = map.get(key) {
+                        let id = item["playlistId"]
+                            .as_str()
+                            .or_else(|| {
+                                item["navigationEndpoint"]["browseEndpoint"]["browseId"]
+                                    .as_str()
+                                    .map(|s| s.strip_prefix("VL").unwrap_or(s))
+                            })
+                            .unwrap_or("");
+                        let title = label(&item["title"]);
+                        let count = ["videoCountShortText", "videoCountText"]
+                            .into_iter()
+                            .map(|k| label(&item[k]))
+                            .find(|s| !s.is_empty())
+                            .unwrap_or_default();
+                        push_playlist(id, title, count, thumb_url(item), out, seen);
+                        return;
+                    }
+                }
+                if let Some(lockup) = map.get("lockupViewModel") {
+                    if lockup["contentType"] == "LOCKUP_CONTENT_TYPE_PLAYLIST" {
+                        let id = lockup["contentId"]
+                            .as_str()
+                            .map(|s| s.strip_prefix("VL").unwrap_or(s))
+                            .unwrap_or("");
+                        let title = label(
+                            &lockup["metadata"]["lockupMetadataViewModel"]["title"]["content"],
+                        );
+                        let count = find(lockup, "thumbnailBadgeViewModel", 0)
+                            .map(|b| label(&b["text"]))
+                            .unwrap_or_default();
+                        push_playlist(id, title, count, thumb_url(lockup), out, seen);
+                    }
+                    return;
+                }
+                for child in map.values() {
+                    walk(child, out, seen, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn push_playlist(
+        id: &str,
+        title: String,
+        count: String,
+        thumb: String,
+        out: &mut Vec<Playlist>,
+        seen: &mut HashSet<String>,
+    ) {
+        if !valid_playlist_id(id) || id.starts_with("RD") || title.is_empty() {
+            return;
+        }
+        if seen.insert(id.to_string()) {
+            out.push(Playlist {
+                id: id.to_string(),
+                title,
+                count,
+                thumb,
+            });
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out, &mut HashSet::new(), 0);
+    out
+}
+pub fn valid_playlist_id(id: &str) -> bool {
+    (2..=180).contains(&id.len())
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+pub fn playlist_id_from_url(raw: &str) -> Option<String> {
+    let url = Url::parse(raw.trim())
+        .or_else(|_| Url::parse(&format!("https://{}", raw.trim())))
+        .ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host != "youtube.com" && !host.ends_with(".youtube.com") {
+        return None;
+    }
+    let path = url.path().trim_matches('/');
+    let has_v = url.query_pairs().any(|(k, v)| k == "v" && !v.is_empty());
+    if path == "playlist" || (path == "watch" && !has_v) {
+        return url
+            .query_pairs()
+            .find(|(k, v)| k == "list" && valid_playlist_id(v))
+            .map(|(_, v)| v.into_owned());
+    }
+    None
 }
 fn identified(id: Option<&str>, title: String, author: String) -> Option<Track> {
     let id = id.filter(|id| valid_id(id))?;
@@ -611,7 +1456,7 @@ fn ad_wait(data: &Value) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_bearer;
+    use super::*;
     use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue};
 
     #[test]
@@ -629,5 +1474,239 @@ mod tests {
         strip_bearer(&mut cookies);
         assert_eq!(cookies.get(AUTHORIZATION).unwrap(), "SAPISIDHASH 123_abc");
         assert_eq!(cookies.get(COOKIE).unwrap(), "SID=abc; SAPISID=xyz");
+    }
+
+    #[test]
+    fn validates_playlist_ids_urls_and_thumbnails() {
+        assert!(valid_playlist_id("PL123abc_-XYZ"));
+        assert!(valid_playlist_id("LM"));
+        assert!(!valid_playlist_id(""));
+        assert!(!valid_playlist_id("a"));
+        assert!(!valid_playlist_id("PL bad/char"));
+
+        assert_eq!(
+            playlist_id_from_url("https://www.youtube.com/playlist?list=PLabc123_-").as_deref(),
+            Some("PLabc123_-")
+        );
+        assert_eq!(
+            playlist_id_from_url("https://music.youtube.com/watch?list=PLmusic99").as_deref(),
+            Some("PLmusic99")
+        );
+        assert!(
+            playlist_id_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc123")
+                .is_none()
+        );
+        assert!(playlist_id_from_url("https://evil.com/playlist?list=PLabc123").is_none());
+
+        assert_eq!(
+            safe_thumb("https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+        );
+        assert_eq!(
+            safe_thumb("https://yt3.googleusercontent.com/abc=s200"),
+            "https://yt3.googleusercontent.com/abc=s200"
+        );
+        assert_eq!(safe_thumb("http://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"), "");
+        assert_eq!(safe_thumb("https://evil.example/img.jpg"), "");
+        assert_eq!(safe_thumb("https://i.ytimg.com:8443/a.jpg"), "");
+    }
+
+    #[test]
+    fn parses_playlists_across_tv_web_and_lockup_and_skips_rd_mixes() {
+        let data = json!({
+            "contents": [
+                {
+                    "tileRenderer": {
+                        "contentType": "TILE_CONTENT_TYPE_PLAYLIST",
+                        "header": {
+                            "tileHeaderRenderer": {
+                                "thumbnail": {"thumbnails": [{"url": "https://i.ytimg.com/vi/1/mqdefault.jpg", "width": 320}]}
+                            }
+                        },
+                        "metadata": {
+                            "tileMetadataRenderer": {
+                                "title": {"simpleText": "Lo-Fi Beats"},
+                                "lines": [{"lineRenderer": {"items": [{"lineItemRenderer": {"text": {"simpleText": "42 видео"}}}]}}]
+                            }
+                        },
+                        "onSelectCommand": {"watchEndpoint": {"playlistId": "PL_tv_lofi_1"}}
+                    }
+                },
+                {
+                    "tileRenderer": {
+                        "contentType": "TILE_CONTENT_TYPE_PLAYLIST",
+                        "metadata": {"tileMetadataRenderer": {"title": {"simpleText": "My Mix"}}},
+                        "onSelectCommand": {"watchEndpoint": {"playlistId": "RDMM123456"}}
+                    }
+                },
+                {
+                    "gridPlaylistRenderer": {
+                        "playlistId": "PL_web_grid_2",
+                        "title": {"runs": [{"text": "В машину"}]},
+                        "videoCountShortText": {"simpleText": "18"},
+                        "thumbnail": {"thumbnails": [{"url": "https://i9.ytimg.com/vi/2/mqdefault.jpg", "width": 320}]}
+                    }
+                },
+                {
+                    "playlistRenderer": {
+                        "playlistId": "PL_search_3",
+                        "title": {"simpleText": "Synthwave Radio"},
+                        "videoCountText": {"runs": [{"text": "60 видео"}]}
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                        "contentId": "VLPL_lockup_4",
+                        "metadata": {"lockupMetadataViewModel": {"title": {"content": "Deep Focus"}}},
+                        "contentImage": {
+                            "collectionThumbnailViewModel": {
+                                "primaryThumbnail": {
+                                    "thumbnailViewModel": {
+                                        "image": {"sources": [{"url": "https://i.ytimg.com/vi/3/hqdefault.jpg", "width": 480}]},
+                                        "overlays": [{"thumbnailOverlayBadgeViewModel": {"thumbnailBadges": [{"thumbnailBadgeViewModel": {"text": "25 видео"}}]}}]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let parsed = parse_playlists(&data);
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].id, "PL_tv_lofi_1");
+        assert_eq!(parsed[0].title, "Lo-Fi Beats");
+        assert_eq!(parsed[0].count, "42 видео");
+        assert_eq!(parsed[0].thumb, "https://i.ytimg.com/vi/1/mqdefault.jpg");
+
+        assert_eq!(parsed[1].id, "PL_web_grid_2");
+        assert_eq!(parsed[1].title, "В машину");
+        assert_eq!(parsed[1].count, "18");
+
+        assert_eq!(parsed[2].id, "PL_search_3");
+        assert_eq!(parsed[2].count, "60 видео");
+
+        assert_eq!(parsed[3].id, "PL_lockup_4");
+        assert_eq!(parsed[3].title, "Deep Focus");
+        assert_eq!(parsed[3].count, "25 видео");
+        assert_eq!(parsed[3].thumb, "https://i.ytimg.com/vi/3/hqdefault.jpg");
+    }
+
+    #[test]
+    fn parses_playlist_tracks_shelf_and_continuation() {
+        let page = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "itemSectionRenderer": {
+                                            "contents": [{
+                                                "playlistVideoListRenderer": {
+                                                    "contents": [
+                                                        {
+                                                            "playlistVideoRenderer": {
+                                                                "videoId": "dQw4w9WgXcQ",
+                                                                "title": {"runs": [{"text": "Track One"}]},
+                                                                "shortBylineText": {"runs": [{"text": "Artist One"}]}
+                                                            }
+                                                        },
+                                                        {
+                                                            "continuationItemRenderer": {
+                                                                "continuationEndpoint": {
+                                                                    "continuationCommand": {"token": "NEXT_PAGE_TOK"}
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                },
+                "unrelatedShelf": {
+                    "videoRenderer": {
+                        "videoId": "jNQXAC9IVRw",
+                        "title": {"simpleText": "Unrelated Suggestion"}
+                    }
+                }
+            }
+        });
+        let shelf = browse_contents(&page);
+        let mut tracks = Vec::new();
+        organic_limit(shelf, &mut tracks, &mut HashSet::new(), 0, 100);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, "dQw4w9WgXcQ");
+        assert_eq!(tracks[0].title, "Track One");
+        assert_eq!(tracks[0].author, "Artist One");
+        assert_eq!(continuation_token(shelf).as_deref(), Some("NEXT_PAGE_TOK"));
+    }
+
+    #[test]
+    fn parses_account_profile_from_menu_and_accounts_list() {
+        let menu = json!({
+            "actions": [{
+                "openPopupAction": {
+                    "popup": {
+                        "multiPageMenuRenderer": {
+                            "header": {
+                                "activeAccountHeaderRenderer": {
+                                    "accountName": {"simpleText": "NewFPV"},
+                                    "channelHandle": {"simpleText": "@newfpv"},
+                                    "email": {"simpleText": "user@example.com"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        assert_eq!(
+            parse_account_profile(&menu),
+            AccountProfile {
+                name: "NewFPV".into(),
+                handle: "@newfpv".into(),
+                email: "user@example.com".into(),
+            }
+        );
+
+        let accounts_list = json!({
+            "contents": [{
+                "accountSectionListRenderer": {
+                    "contents": [
+                        {
+                            "accountItemRenderer": {
+                                "isSelected": false,
+                                "accountName": {"simpleText": "Другой канал"},
+                                "accountByline": {"simpleText": "@other"}
+                            }
+                        },
+                        {
+                            "accountItemRenderer": {
+                                "isSelected": true,
+                                "accountName": {"runs": [{"text": "Основной канал"}]},
+                                "accountByline": {"simpleText": "main@example.com"}
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+        assert_eq!(
+            parse_account_profile(&accounts_list),
+            AccountProfile {
+                name: "Основной канал".into(),
+                handle: String::new(),
+                email: "main@example.com".into(),
+            }
+        );
     }
 }

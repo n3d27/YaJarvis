@@ -3,7 +3,7 @@
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$HERE/.." && pwd)"
-VER="${JARVIS_VERSION:-0.10.16+spotify}"
+VER="${JARVIS_VERSION:-0.10.18+spotify}"
 HOST="${STATION_HOST:-}"
 PORT="${STATION_PORT:-2222}"
 KEY="${STATION_KEY:-}"

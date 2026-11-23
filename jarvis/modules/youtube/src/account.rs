@@ -1,4 +1,4 @@
-use crate::remote::{Remote, TV_AGENT, WEB_VERSION};
+use crate::remote::{AccountProfile, Remote, TV_AGENT, WEB_VERSION};
 use jarvis_home_common::{Host, now, random, save, text};
 use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ pub struct Account {
     host: Arc<Host>,
     flow: Mutex<Login>,
     token: AsyncMutex<Option<(Instant, String, String)>>,
+    profile: AsyncMutex<Option<(Instant, AccountProfile)>>,
 }
 
 impl Account {
@@ -33,19 +34,89 @@ impl Account {
             host,
             flow: Mutex::default(),
             token: AsyncMutex::default(),
+            profile: AsyncMutex::default(),
         }
     }
 
-    pub async fn state(&self) -> Result<Value, String> {
-        let auth = self.host.config().await?["auth"].clone();
-        let flow = self.flow.lock().unwrap();
-        Ok(
-            json!({"signed_in":!text(&auth["refresh"]).is_empty(),"name":auth["name"],
-            "code":flow.code,"url":flow.url,"error":flow.error}),
-        )
+    pub async fn clear_profile_cache(&self) {
+        *self.profile.lock().await = None;
     }
 
-    pub async fn begin(self: &Arc<Self>) -> Result<Value, String> {
+    pub async fn state(&self, remote: &Remote) -> Result<Value, String> {
+        let auth = self.host.config().await?["auth"].clone();
+        let refresh = text(&auth["refresh"]);
+        let mut name = text(&auth["name"]);
+        let mut handle = text(&auth["handle"]);
+        let mut email = text(&auth["email"]);
+        let signed_in = !refresh.is_empty();
+        let needs_lookup =
+            (name.is_empty() || name == "Аккаунт Google") || (handle.is_empty() && email.is_empty());
+        if (signed_in && needs_lookup) || (!signed_in && self.has_cookies()) {
+            let cached = {
+                let guard = self.profile.lock().await;
+                guard.as_ref().and_then(|(at, profile)| {
+                    let ttl = if profile.is_empty() {
+                        Duration::from_secs(60)
+                    } else {
+                        Duration::from_secs(1800)
+                    };
+                    (at.elapsed() < ttl).then(|| profile.clone())
+                })
+            };
+            let resolved = match cached {
+                Some(profile) => profile,
+                None => {
+                    let headers = if signed_in {
+                        self.headers(false).await.unwrap_or_default()
+                    } else {
+                        self.cookie_headers()
+                    };
+                    let profile = if headers.is_empty() {
+                        AccountProfile::default()
+                    } else {
+                        remote.account_profile(headers).await.unwrap_or_default()
+                    };
+                    *self.profile.lock().await = Some((Instant::now(), profile.clone()));
+                    profile
+                }
+            };
+            let mut improved = false;
+            if !resolved.name.is_empty() && (name.is_empty() || name == "Аккаунт Google") {
+                name = resolved.name;
+                improved = true;
+            }
+            if handle.is_empty() && !resolved.handle.is_empty() {
+                handle = resolved.handle;
+                improved = true;
+            }
+            if email.is_empty() && !resolved.email.is_empty() {
+                email = resolved.email;
+                improved = true;
+            }
+            if signed_in && improved {
+                let _ = self
+                    .host
+                    .set(
+                        auth,
+                        json!({"refresh": refresh, "name": name, "handle": handle, "email": email}),
+                        true,
+                    )
+                    .await;
+            }
+        }
+        let flow = self.flow.lock().unwrap();
+        Ok(json!({
+            "signed_in": signed_in,
+            "name": name,
+            "handle": handle,
+            "email": email,
+            "code": flow.code,
+            "url": flow.url,
+            "error": flow.error
+        }))
+    }
+
+    pub async fn begin(self: &Arc<Self>, remote: &Arc<Remote>) -> Result<Value, String> {
         let mut token = self.token.lock().await;
         let device = hex::encode(random::<16>()?);
         let reply = self
@@ -95,10 +166,11 @@ impl Account {
                 .unwrap_or_else(|| "https://www.google.com/device".into());
             flow.error.clear();
             let account = self.clone();
+            let remote_bg = Arc::clone(remote);
             flow.task = Some(tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     Duration::from_secs(ttl),
-                    account.poll(&device_code, interval),
+                    account.poll(&remote_bg, &device_code, interval),
                 )
                 .await
                 .unwrap_or_else(|_| Err("Код истёк".into()));
@@ -110,10 +182,10 @@ impl Account {
             }));
         }
         drop(token);
-        self.state().await
+        self.state(remote).await
     }
 
-    async fn poll(&self, code: &str, mut interval: u64) -> Result<(), String> {
+    async fn poll(&self, remote: &Remote, code: &str, mut interval: u64) -> Result<(), String> {
         loop {
             tokio::time::sleep(Duration::from_secs(interval)).await;
             let Ok(reply) = self
@@ -143,44 +215,47 @@ impl Account {
             if refresh.is_empty() || access.is_empty() {
                 return Err("Google не выдал токен YouTube".into());
             }
-            let name = self
-                .channel_name(&access)
-                .await
-                .unwrap_or_else(|| "Аккаунт Google".into());
+            let profile = if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {access}")) {
+                value.set_sensitive(true);
+                let mut headers = HeaderMap::new();
+                headers.insert(AUTHORIZATION, value);
+                remote.account_profile(headers).await.unwrap_or_default()
+            } else {
+                AccountProfile::default()
+            };
+            let name = if profile.name.is_empty() {
+                "Аккаунт Google".to_string()
+            } else {
+                profile.name.clone()
+            };
             let mut token = self.token.lock().await;
             let before = self.host.config().await?["auth"].clone();
             self.host
-                .set(before, json!({"refresh":refresh,"name":name}), true)
+                .set(
+                    before,
+                    json!({
+                        "refresh": refresh,
+                        "name": name,
+                        "handle": profile.handle,
+                        "email": profile.email
+                    }),
+                    true,
+                )
                 .await?;
             *token = Some((expiry(&reply), refresh, access));
+            *self.profile.lock().await = Some((Instant::now(), profile));
             return Ok(());
         }
-    }
-
-    async fn channel_name(&self, access: &str) -> Option<String> {
-        let res = self
-            .host
-            .client()
-            .await
-            .ok()?
-            .get("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true")
-            .bearer_auth(access)
-            .send()
-            .await
-            .ok()?;
-        let value = jarvis_home_common::json(res).await.ok()?;
-        value["items"][0]["snippet"]["title"]
-            .as_str()
-            .map(str::to_owned)
     }
 
     pub async fn logout(&self) -> Result<(), String> {
         let mut token = self.token.lock().await;
         self.close();
         *token = None;
+        *self.profile.lock().await = None;
         let before = self.host.config().await?["auth"].clone();
         self.host
-            .set(before, json!({"refresh":"","name":""}), false)
+            .set(before, json!({"refresh":"","name":"","handle":"","email":""}), false)
             .await
     }
 
@@ -250,9 +325,10 @@ impl Account {
             if access.is_empty() {
                 if reply["error"] == "invalid_grant" {
                     self.host
-                        .set(auth, json!({"refresh":"","name":""}), false)
+                        .set(auth, json!({"refresh":"","name":"","handle":"","email":""}), false)
                         .await?;
                     *token = None;
+                    *self.profile.lock().await = None;
                     return Ok(cookies);
                 }
                 return Err("Google не обновил токен YouTube".into());
@@ -270,6 +346,16 @@ impl Account {
 
     pub fn has_cookies(&self) -> bool {
         self.host.data.join(COOKIES).is_file()
+    }
+
+    pub async fn is_signed_in(&self) -> bool {
+        if self.has_cookies() {
+            return true;
+        }
+        let Ok(config) = self.host.config().await else {
+            return false;
+        };
+        !text(&config["auth"]["refresh"]).is_empty()
     }
 
     pub fn web_headers(&self) -> HeaderMap {

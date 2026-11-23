@@ -243,17 +243,29 @@ export async function music(body, btn) {
   }
 }
 
-export async function playMusicQuery(query) {
+export async function playMusicAction(body) {
   const before = M;
   const loading = { ...before, loading: true };
   M = loading;
   renderMusic();
-  const ok = await music({ action: "play", query });
+  const ok = await music(body);
   if (!ok && M === loading) {
     M = before || { loading: false };
     renderMusic();
   }
   return ok;
+}
+
+export async function playMusicQuery(query) {
+  return playMusicAction({ action: "play", query });
+}
+
+export function youtubeLibrary(refresh = false) {
+  return api("GET", refresh ? "/api/youtube/library?refresh=1" : "/api/youtube/library");
+}
+
+export function youtubePlaylistItems(id, refresh = false) {
+  return api("GET", `/api/youtube/playlist/${encodeURIComponent(id)}${refresh ? "?refresh=1" : ""}`);
 }
 
 export function artOf(track, big, state = M) {
